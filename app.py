@@ -160,6 +160,11 @@ class GroqChatClient:
             except json.JSONDecodeError:
                 error_payload = {}
             error_info = error_payload.get("error", {})
+            error_code = (
+                error_info.get("code")
+                if isinstance(error_info, dict)
+                else error_payload.get("code")
+            )
             message = (
                 error_info.get("message")
                 if isinstance(error_info, dict)
@@ -169,7 +174,21 @@ class GroqChatClient:
                 message = error_payload.get("message")
             if not isinstance(message, str) and response_body and not response_body.startswith("<"):
                 message = response_body
-            if isinstance(message, str) and message.strip():
+            is_cloudflare_1010 = str(error_code) == "1010" or bool(
+                re.search(
+                    r"\berror(?:\s+code)?\s*[:#]?\s*1010\b",
+                    response_body,
+                    flags=re.IGNORECASE,
+                )
+            )
+            if error.code == 403 and is_cloudflare_1010:
+                detail = (
+                    " Groq's edge security layer rejected the request with error 1010. "
+                    "This is usually a network, IP, or proxy restriction rather than an "
+                    "API key or model permission issue. Try a trusted network without a "
+                    "VPN or proxy; if it persists, contact Groq support."
+                )
+            elif isinstance(message, str) and message.strip():
                 message = message.strip()
                 message = message.replace(self.api_key, "[redacted]")
                 message = re.sub(

@@ -29,7 +29,7 @@ The app loads `.env` without an additional package. Values already set in the en
 
 ### Troubleshooting HTTP 403
 
-A 403 means Groq refused the request. Confirm the key is active in the intended Groq project and that the project can use the model configured by `GROQ_MODEL`. The default model is `llama-3.3-70b-versatile`; verify it is currently available to your account in the Groq model catalog. If you previously set `GROQ_API_KEY` in PowerShell, that environment value overrides `.env`; clear it for the current shell with:
+A 403 means Groq refused the request. Confirm the key is active in the intended Groq project and that the project can use the model configured by `GROQ_MODEL`. The default model is `llama-3.3-70b-versatile`; verify it is currently available to your account in the Groq model catalog. If the response includes error code `1010`, Groq's edge security layer is blocking the request, commonly because of a network, IP, VPN, or proxy restriction; try a trusted network without a VPN or proxy, and contact Groq support if it continues. Other 403 responses may indicate key, project, or model permissions. If you previously set `GROQ_API_KEY` in PowerShell, that environment value overrides `.env`; clear it for the current shell with:
 
 ```powershell
 $env:GROQ_API_KEY = $null

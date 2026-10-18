@@ -143,6 +143,44 @@ class GroqIntegrationTests(unittest.TestCase):
                     {"balance": 1000},
                 )
 
+    def test_cloudflare_1010_error_explains_network_restriction(self) -> None:
+        http_error = urllib.error.HTTPError(
+            "https://api.groq.com/openai/v1/chat/completions",
+            403,
+            "Forbidden",
+            {},
+            BytesIO(b"<html><h1>Error 1010</h1></html>"),
+        )
+
+        with patch("app.urllib.request.urlopen", side_effect=http_error):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"error 1010.*network, IP, or proxy restriction",
+            ):
+                GroqChatClient("test-key", "test-model").answer(
+                    "What is my balance?",
+                    {"balance": 1000},
+                )
+
+    def test_structured_1010_error_code_gets_network_guidance(self) -> None:
+        http_error = urllib.error.HTTPError(
+            "https://api.groq.com/openai/v1/chat/completions",
+            403,
+            "Forbidden",
+            {},
+            BytesIO(json.dumps({"error": {"code": "1010"}}).encode()),
+        )
+
+        with patch("app.urllib.request.urlopen", side_effect=http_error):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"error 1010.*network, IP, or proxy restriction",
+            ):
+                GroqChatClient("test-key", "test-model").answer(
+                    "What is my balance?",
+                    {"balance": 1000},
+                )
+
     def test_blocked_prompt_never_reaches_model(self) -> None:
         chatbot = BankingChatbot("unused-test-key", "test-model")
         chatbot.client = Mock()
