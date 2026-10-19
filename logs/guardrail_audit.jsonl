@@ -22,3 +22,9 @@
 {"timestamp": "2026-10-18T10:53:23.770428+00:00", "customer_id": "CUST_001", "event": "llm_request", "outcome": "ERROR", "reason": "api_request_failed"}
 {"timestamp": "2026-10-18T10:59:13.862963+00:00", "customer_id": "CUST_001", "event": "input_screen", "outcome": "ALLOW", "reason": "input_accepted"}
 {"timestamp": "2026-10-18T10:59:14.149688+00:00", "customer_id": "CUST_001", "event": "llm_request", "outcome": "ERROR", "reason": "api_request_failed"}
+{"timestamp": "2026-10-18T11:06:09.752678+00:00", "customer_id": "CUST_001", "event": "input_screen", "outcome": "ALLOW", "reason": "input_accepted"}
+{"timestamp": "2026-10-18T11:06:09.999285+00:00", "customer_id": "CUST_001", "event": "llm_request", "outcome": "ERROR", "reason": "api_request_failed"}
+{"timestamp": "2026-10-18T11:10:49.696404+00:00", "customer_id": "CUST_001", "event": "input_screen", "outcome": "ALLOW", "reason": "input_accepted"}
+{"timestamp": "2026-10-18T11:10:50.063295+00:00", "customer_id": "CUST_001", "event": "llm_request", "outcome": "ERROR", "reason": "api_request_failed"}
+{"timestamp": "2026-10-18T11:12:54.999248+00:00", "customer_id": "CUST_001", "event": "input_screen", "outcome": "ALLOW", "reason": "input_accepted"}
+{"timestamp": "2026-10-18T11:12:55.262289+00:00", "customer_id": "CUST_001", "event": "llm_request", "outcome": "ERROR", "reason": "api_request_failed"}
