@@ -3,3 +3,6 @@ __pycache__/
 *.py[cod]
 .venv/
 guradrails_audit.jsonl
+data/customer_shopping.sqlite3
+data/customer_shopping.sqlite3-shm
+data/customer_shopping.sqlite3-wal
