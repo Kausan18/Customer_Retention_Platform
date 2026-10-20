@@ -44,7 +44,7 @@ The app reads `.env` without an additional package. Existing operating-system en
 | Setting | Purpose | Application fallback |
 | --- | --- | --- |
 | `GEMINI_API_KEY` | Google Gemini API key | Required; app exits with setup guidance if missing |
-| `GEMINI_MODEL` | Gemini model name | `gemini-3.8-flash` |
+| `GEMINI_MODEL` | Gemini model name | `gemini-3.5-flash-lite` |
 | `GEMINI_TIMEOUT_SECONDS` | Gemini request timeout in seconds | `120` |
 | `DEMO_PIN` | Shared demo login PIN | `1234` |
 
@@ -56,7 +56,7 @@ python app.py
 
 The terminal asks for a customer ID present in the CSV, then visibly prompts for the demo PIN. The PIN is shared across customers; it is a demonstration gate and not production authentication. `/logout` invalidates the current session and returns to login; `/help` describes supported topics; `/quit` or `/exit` exits.
 
-**Configuration note:** The current application fallback and README specify `gemini-3.8-flash`. The checked-in `.env.example` currently specifies `gemini-3.5-flash-lite`; if that template is copied to `.env`, its `GEMINI_MODEL` value overrides the application fallback. Check that setting against the model intended for the API account.
+**Configuration note:** The current application fallback and README specify `gemini-3.5-flash-lite`. The checked-in `.env.example` currently specifies `gemini-3.5-flash-lite`; if that template is copied to `.env`, its `GEMINI_MODEL` value overrides the application fallback. Check that setting against the model intended for the API account.
 
 ## Current user features
 
