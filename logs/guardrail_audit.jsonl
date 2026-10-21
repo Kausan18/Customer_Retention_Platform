@@ -71,3 +71,14 @@
 {"timestamp": "2026-10-20T11:18:38.486497+00:00", "customer_id": "C241288", "event": "chat_request", "outcome": "ALLOW", "reason": "response_checked"}
 {"timestamp": "2026-10-20T11:19:11.393893+00:00", "customer_id": "C241288", "event": "input_screen", "outcome": "ALLOW", "reason": "input_accepted"}
 {"timestamp": "2026-10-20T11:19:11.394382+00:00", "customer_id": "C241288", "event": "request_validation", "outcome": "BLOCK", "reason": "unsupported_topic"}
+{"timestamp": "2026-10-21T04:50:40.292731+00:00", "customer_id": "C569580", "event": "input_screen", "outcome": "ALLOW", "reason": "input_accepted"}
+{"timestamp": "2026-10-21T04:50:41.802830+00:00", "customer_id": "C569580", "event": "chat_request", "outcome": "ALLOW", "reason": "response_checked"}
+{"timestamp": "2026-10-21T04:51:34.130617+00:00", "customer_id": "C569580", "event": "input_screen", "outcome": "ALLOW", "reason": "input_accepted"}
+{"timestamp": "2026-10-21T04:51:36.066829+00:00", "customer_id": "C569580", "event": "chat_request", "outcome": "ALLOW", "reason": "response_checked"}
+{"timestamp": "2026-10-21T04:51:59.177237+00:00", "customer_id": "C569580", "event": "input_screen", "outcome": "ALLOW", "reason": "input_accepted"}
+{"timestamp": "2026-10-21T04:52:00.642476+00:00", "customer_id": "C569580", "event": "chat_request", "outcome": "ALLOW", "reason": "response_checked"}
+{"timestamp": "2026-10-21T04:52:26.903030+00:00", "customer_id": "C569580", "event": "input_screen", "outcome": "BLOCK", "reason": "cross_customer_access"}
+{"timestamp": "2026-10-21T04:52:35.145291+00:00", "customer_id": "C569580", "event": "input_screen", "outcome": "ALLOW", "reason": "input_accepted"}
+{"timestamp": "2026-10-21T04:52:35.146658+00:00", "customer_id": "C569580", "event": "request_validation", "outcome": "BLOCK", "reason": "unsupported_topic"}
+{"timestamp": "2026-10-21T04:52:53.173116+00:00", "customer_id": "C569580", "event": "input_screen", "outcome": "ALLOW", "reason": "input_accepted"}
+{"timestamp": "2026-10-21T04:52:53.173887+00:00", "customer_id": "C569580", "event": "request_validation", "outcome": "BLOCK", "reason": "unsupported_topic"}
