@@ -82,3 +82,7 @@
 {"timestamp": "2026-10-21T04:52:35.146658+00:00", "customer_id": "C569580", "event": "request_validation", "outcome": "BLOCK", "reason": "unsupported_topic"}
 {"timestamp": "2026-10-21T04:52:53.173116+00:00", "customer_id": "C569580", "event": "input_screen", "outcome": "ALLOW", "reason": "input_accepted"}
 {"timestamp": "2026-10-21T04:52:53.173887+00:00", "customer_id": "C569580", "event": "request_validation", "outcome": "BLOCK", "reason": "unsupported_topic"}
+{"timestamp": "2026-10-23T10:52:34.054343+00:00", "customer_id": "C289625", "event": "input_screen", "outcome": "ALLOW", "reason": "input_accepted"}
+{"timestamp": "2026-10-23T10:53:20.779810+00:00", "customer_id": "C289625", "event": "chat_request", "outcome": "ALLOW", "reason": "response_checked"}
+{"timestamp": "2026-10-23T10:53:43.640602+00:00", "customer_id": "C289625", "event": "input_screen", "outcome": "ALLOW", "reason": "input_accepted"}
+{"timestamp": "2026-10-23T10:54:08.899149+00:00", "customer_id": "C289625", "event": "chat_request", "outcome": "ALLOW", "reason": "response_checked"}
