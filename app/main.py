@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from injection import (
+from app.guardrails.input_screener import (
     GuardrailDecision,
     clean_response,
     inspect_request,
@@ -23,7 +23,7 @@ from injection import (
     is_supported_question,
 )
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 CSV_FILE = ROOT / "data" / "customer_shopping_data.csv" / "customer_shopping_data.csv"
 DATABASE_FILE = ROOT / "data" / "customer_shopping.sqlite3"
 LOG_FILE = ROOT / "logs" / "guardrail_audit.jsonl"
@@ -31,7 +31,7 @@ ENV_FILE = ROOT / ".env"
 RATE_LIMIT_REQUESTS = 8
 RATE_LIMIT_WINDOW_SECONDS = 60
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models"
-DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_GEMINI_TIMEOUT_SECONDS = 120
 EXPECTED_CSV_COLUMNS = (
     "invoice_no",

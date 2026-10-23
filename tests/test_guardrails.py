@@ -14,7 +14,7 @@ from app import (
     load_environment,
     prompt_demo_pin,
 )
-from injection import (
+from app.guardrails.input_screener import (
     clean_response,
     inspect_request,
     inspect_response,
