@@ -318,10 +318,13 @@ def generate_orders(
 
         delivered_at = None
         if status == "delivered":
-            # delivered between 1 and 60 days after creation, but not in the future
-            delivered_at = created_at + timedelta(days=rng.randint(1, 10))
-            if delivered_at > now:
-                delivered_at = now - timedelta(days=rng.randint(0, 2))
+            # 80% of delivered orders: recent (1–10 days), within both windows
+            # 20% of delivered orders: aged (35–60 days), outside both windows
+            if rng.random() < 0.80:
+                delivered_at = now - timedelta(days=rng.randint(1, 10))
+            else:
+                delivered_at = now - timedelta(days=rng.randint(35, 60))
+            
 
         # 1-3 items per order
         n_items = rng.randint(1, 3)
