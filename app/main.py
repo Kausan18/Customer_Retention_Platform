@@ -14,6 +14,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from fastapi import FastAPI
+from app.api import tickets, runs, approvals
+from app.auth.session import create_session, invalidate_session
+from app.db.database import fetch_one
+import hmac, os
+from pydantic import BaseModel
+
 
 from app.guardrails.input_screener import (
     GuardrailDecision,
@@ -530,6 +537,50 @@ def main() -> None:
         chatbot.data.close()
     print("Goodbye.")
 
+app = FastAPI(title="Customer Support Agent", version="1.0.0")
+app.include_router(tickets.router)
+app.include_router(runs.router)
+app.include_router(approvals.router)
+
+
+class LoginRequest(BaseModel):
+    customer_id: str
+    pin: str
+
+
+@app.post("/auth/login")
+def login(body: LoginRequest):
+    from fastapi import HTTPException, status as http_status
+    import unicodedata
+
+    customer_id = unicodedata.normalize("NFKC", body.customer_id.strip()).upper()
+    pin = body.pin.strip()
+
+    # Verify customer exists in the seeded support database.
+    row = fetch_one("SELECT customer_id FROM orders WHERE customer_id = ? LIMIT 1", (customer_id,))
+    if row is None:
+        raise HTTPException(status_code=http_status.HTTP_401_UNAUTHORIZED, detail="Customer not found.")
+
+    expected_pin = os.environ.get("DEMO_PIN", "1234")
+    if not hmac.compare_digest(pin, expected_pin):
+        raise HTTPException(status_code=http_status.HTTP_401_UNAUTHORIZED, detail="Invalid PIN.")
+
+    token = create_session(customer_id)
+    return {"token": token, "customer_id": customer_id}
+
+
+@app.post("/auth/logout")
+def logout(request):
+    from fastapi import Request
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        invalidate_session(auth[7:])
+    return {"status": "logged out"}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 if __name__ == "__main__":
     main()

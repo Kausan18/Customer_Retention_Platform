@@ -20,6 +20,8 @@ INJECTION_PATTERNS = (
     r"\binternal[_ ]risk[_ ]score\b",
     r"\b(sqlite_master|information_schema|select\s+.+\s+from|drop\s+table|union\s+select)\b",
     r"\b(database|table)\s+(schema|structure|contents?)\b",
+    r"\b(what is|what's|show me|tell me|display)\b.{0,40}\b(system prompt|developer message|hidden instructions?)\b",
+    r"\b(run|call|invoke|execute|trigger)\b.{0,40}\b(execute_|create_|get_|update_|search_)\w+",
 )
 
 SUPPORTED_TOPICS = (
