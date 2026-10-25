@@ -228,8 +228,155 @@ All checks passed. Output matches exactly on both the build machine and the deve
 
 ---
 
-### Up Next — Week 1, Day 3–4
+## Session 2 — Week 1, Day 3–4: Mock Services and Eligibility Logic
 
-- `mock_services/payment_service.py` — charge, refund, get_status endpoints with configurable success/failure/timeout/delay modes
-- `mock_services/shipping_service.py` — create_shipment, get_tracking with in_transit/delivered/delayed states
-- `app/services/eligibility.py` — pure Python deterministic rules for refund and exchange eligibility, no LLM involved
+**Date:** 2026-10-25
+**Status:** ✅ Checkpoint 2 passed
+
+Goal
+
+Build the three files that sit on either side of the eligibility decision:
+
+mock_services/payment_service.py — simulates a third-party payment provider with idempotency and configurable failure modes
+mock_services/shipping_service.py — simulates a shipping carrier with configurable failure modes
+app/services/eligibility.py — pure Python deterministic refund and exchange eligibility rules, no LLM
+
+These three files are independent of each other and independent of LangGraph. Checkpoint 2 proves the business logic is correct before any agent touches it.
+
+Context
+
+Session 1 left a verified SQLite database with 200 orders, 30 products, 27 returns, and all integrity checks passing. Session 2 builds the layer immediately above that data: the services that read it (eligibility) and the external mocks that write to it (payment, shipping). No FastAPI, no LangGraph, no LLM is involved in this session.
+
+Step 1 — mock_services/payment_service.py
+
+What: Self-contained module simulating a payment provider. Exposes three operations: charge, refund, and get_status. Reads and writes the payments table directly via app/db/database.py.
+
+Why: The refund workflow tool layer (Week 1 Day 5–6) calls this service. Its contract — what it returns on success, failure, and timeout — must be defined before the tools that consume it are written. More critically, refund() is the only operation in V1 where a duplicate write causes direct, unrecoverable financial damage. That makes idempotency a first-class concern here and nowhere else in V1.
+
+How:
+
+charge(order_id, amount_minor, payment_method) — marks an order as paid. Inserts or updates the payments row. Returns {"success": True, "transaction_id": "txn_..."} or a structured failure.
+
+refund(order_id, amount_minor, idempotency_key) — the critical operation. Before any DB read, failure mode check, or balance validation, checks a module-level _idempotency_store dict keyed on idempotency_key. If the key exists and the amount matches, returns the stored result immediately with no DB write. If the key exists but the amount differs, returns IDEMPOTENCY_PAYLOAD_MISMATCH — this prevents a race condition where a bug changes the amount between retries. Only after a confirmed successful DB write does the result get stored in _idempotency_store. Failed operations (provider declined, timeout, pending) are never stored, so retries after failure are safe.
+
+Balance check: rejects if amount_minor > paid_amount_minor - refunded_minor. Updates payments.refunded_minor and sets status to refunded or partially_refunded depending on whether the balance is fully consumed.
+
+get_status(order_id) — reads current payment state. Returns structured dict with status, amount_minor, refunded_minor, payment_method, paid_at.
+
+Failure modes — controlled by set_mode(mode):
+
+Mode	Behavior
+success (default)	Operations complete normally
+failure	refund() returns PROVIDER_DECLINED, retryable=False
+timeout	refund() raises TimeoutError after short sleep
+delay	refund() sleeps 2.5 seconds then proceeds normally
+pending	refund() returns PROCESSING, retryable=True, status=pending
+
+reset_idempotency_store() is provided as a test helper to clear stored results between test cases.
+
+Key design decisions:
+
+Idempotency store checked first, before failure modes. A confirmed prior result is always returned as-is regardless of current mode.
+Failed calls are not stored — only successful committed writes are. This matches real provider contracts.
+Structured error returns throughout ({"success": False, "error_code": "...", "retryable": bool, "message": "..."}). No bare exceptions for expected failure paths.
+Service writes directly to payments table. It has no separate DB — payments is the financial ledger.
+Step 2 — mock_services/shipping_service.py
+
+What: Simulates a shipping carrier. Exposes create_shipment and get_tracking. Reads and writes the shipments table via database.py.
+
+Why: Needed by the order_tracking_graph (Week 2) which translates raw shipment status into customer-friendly language. The service must exist and return realistic status values before that LLM node is written.
+
+How:
+
+create_shipment(order_id, carrier, items_summary) — inserts a shipment row with status=processing. Rejects if a shipment already exists for the order (SHIPMENT_ALREADY_EXISTS). Assigns carrier from argument or deterministically from _CARRIERS list based on hash(order_id).
+
+get_tracking(order_id) — reads the shipment row and returns carrier, tracking ID, status, estimated delivery, and last updated. Status values match what seed.py seeded: processing, in_transit, out_for_delivery, delivered, delayed.
+
+Failure modes — set_mode() supports success, failure (CARRIER_UNAVAILABLE, retryable=True), timeout.
+
+Why simpler than payment service: No financial consequence. A wrong tracking status doesn't move money. No idempotency store needed — create_shipment is naturally idempotent via the existence check.
+
+Step 3 — app/services/eligibility.py
+
+What: Pure Python module with two public functions: check_refund_eligibility(order_id) and check_exchange_eligibility(order_id). No LLM. No tools. SQL reads via database.py and business rule evaluation only.
+
+Why pure code: V1_Project_Definition.md is explicit: check_eligibility <- CODE: deterministic rules, not LLM. Financial eligibility must be reproducible, auditable, and immune to hallucination. An LLM could decide a 45-day-old order is eligible because the customer seems upset. This code cannot.
+
+check_refund_eligibility(order_id) — 8 conditions checked in order, first failure short-circuits:
+
+Rule	Condition	Error code on failure
+1	Order exists	ORDER_NOT_FOUND
+2	orders.status == 'delivered'	NOT_DELIVERED
+3	Within 30 days of delivered_at	OUTSIDE_WINDOW
+4	payments.status in {paid, partially_refunded}	PAYMENT_NOT_PAID
+5	paid_amount_minor - refunded_minor > 0	ALREADY_REFUNDED
+6	A return row exists for this order	NO_RETURN_FOUND
+7	returns.status in {received, inspecting, passed}	RETURN_NOT_RECEIVED
+8	returns.inspection_status == 'passed'	INSPECTION_NOT_PASSED
+
+On pass: {"eligible": True, "order_id": ..., "refundable_amount_minor": ..., "reason": "..."}. On fail: {"eligible": False, "order_id": ..., "error_code": "...", "reason": "..."}.
+
+check_exchange_eligibility(order_id) — 4 conditions:
+
+Rule	Condition	Error code on failure
+1	Order exists	ORDER_NOT_FOUND
+2	orders.status == 'delivered'	NOT_DELIVERED
+3	Within 15 days of delivered_at (tighter than refund)	OUTSIDE_WINDOW
+4	payments.status == 'paid' (not partially/fully refunded)	PAYMENT_NOT_PAID / ALREADY_REFUNDED
+
+On pass: {"eligible": True, "order_id": ..., "items": [...], "reason": "..."} — includes order items with product_id, product_name, category, quantity, price_minor for the exchange workflow to find a same-category replacement.
+
+Key design decisions:
+
+Both functions accept an optional now: datetime parameter for testability — pass a fixed datetime to test window boundary conditions without needing aged seed data.
+_parse_dt() tries four formats including %Y-%m-%dT%H:%M:%SZ (Z-suffix) because SQLite timestamps from the seed include the Z.
+Returns structured dicts, not booleans or exceptions. The calling workflow node reads result["eligible"] and result["error_code"] to branch. Raising exceptions for "business rule not met" would conflate expected outcomes with unexpected errors.
+Uses fetch_all for returns and takes the most recent row (ORDER BY id DESC LIMIT 1) to handle the case where multiple return attempts exist.
+Step 4 — tests/test_eligibility.py
+
+What: Checkpoint 2 verification script. Queries the seeded DB to find real rows matching each case shape, calls the eligibility functions, asserts expected verdicts.
+
+Why query-based not ID-hardcoded: Hardcoding ord_0006 as the canonical eligible case (as noted in Session 1) proved fragile — after the seed date fix, ord_0006 landed on pending status. The test now finds the first order satisfying each shape dynamically, making it resilient to re-seeding.
+
+13 cases across two groups:
+
+Refund (7): anchor (first eligible order), eligible fields present, deterministic repeat, not-delivered block, no-return block, outside-window block. Exchange (6): anchor (first eligible order), eligible with items returned, deterministic repeat, items include product fields, not-delivered block, outside-window block.
+
+Issues Encountered and Resolutions
+
+Issue 1: delivered_at timestamps had Z suffix The seed stored timestamps as '2026-10-20T20:10:55Z'. _parse_dt in eligibility.py only tried formats without the Z, so datetime.strptime raised ValueError on every date parse, causing the window check to never run. Fix: added "%Y-%m-%dT%H:%M:%SZ" as the first format tried in _DATE_FORMATS.
+
+Issue 2: Seed generated August dates regardless of when it ran delivered_at was computed as created_at + timedelta(days=rng.randint(1, 10)) where created_at was itself offset from a base date in the past. With fixed seed 42, every run produced the same August timestamps — all outside the 30-day refund window. Fix: changed to delivered_at = now - timedelta(days=rng.randint(1, 10)) so delivered orders are always 1–10 days old relative to seed time, and added a 20% bucket of rng.randint(35, 60) days for outside-window test coverage.
+
+Issue 3: find_eligible_refund_order() query not matching eligible rows The SQL JOIN was correct but the in-Python window check was missing — the query returned orders without filtering by delivered_at age, so it picked orders that passed the DB JOIN conditions but were still outside the 30-day window at runtime. Fix: added a _parse_dt_test() helper in the test file and a Python-side window filter that iterates results and returns the first one within the applicable window.
+
+Issue 4: Stale SQLite files causing path confusion Three extra SQLite files existed across data/ and app/data/: customer_shopping.sqlite3, customer-shopping.sqlite3, and a stale customer_support.sqlite3 in app/data/. These were remnants from the base version and the Session 1 restructure. All three were deleted. The only SQLite file in the project is now data/customer_support.sqlite3.
+
+Checkpoint 2 — Verified Output
+=== Checkpoint 2 Results ===
+  PASS | RF-ANCHOR first eligible refund order (ord_0167)  | eligible=True reason=All refund conditions met: delivered within window, payment paid, return received, inspection passed.
+  PASS | RF-01 eligible (ord_0167)                         | eligible=True refundable=1409500
+  PASS | RF-02 deterministic repeat (ord_0167)             | Calling check_refund_eligibility twice gives the same verdict
+  PASS | RF-03 fields present (ord_0167)                   | order_status=delivered
+  PASS | RF-04 not delivered (ord_0001)                    | error_code=NOT_DELIVERED
+  PASS | RF-05 no return found (ord_0009)                  | error_code=NO_RETURN_FOUND
+  PASS | RF-06 outside window (ord_0119)                   | error_code=OUTSIDE_WINDOW
+  PASS | EX-ANCHOR first eligible exchange order (ord_0009)| eligible=True reason=All exchange conditions met: delivered within window, payment paid.
+  PASS | EX-01 eligible (ord_0009)                         | eligible=True items=3
+  PASS | EX-02 deterministic repeat (ord_0009)             | Calling check_exchange_eligibility twice gives the same verdict
+  PASS | EX-03 items include product fields (ord_0009)     | Each returned item has product_id and category for same-category lookup
+  PASS | EX-04 not delivered (ord_0001)                    | error_code=NOT_DELIVERED
+  PASS | EX-05 outside 15-day window (ord_0119)            | error_code=OUTSIDE_WINDOW
+
+13/13 cases passed.
+Notes for Next Session
+ord_0167 is the new canonical eligible refund case (delivered recently, return received, inspection passed, ₹14,095 refundable).
+ord_0009 is the canonical eligible exchange case (delivered recently, paid, 3 items available for same-category lookup).
+ord_0119 is the canonical outside-window case for both refund and exchange boundary tests.
+The idempotency store in payment_service.py is process-scoped. reset_idempotency_store() must be called between test cases that test retry behavior — noted for the tool authorizer tests in Week 1 Day 5–6.
+mock_services/ has no __init__.py yet — add one before importing from FastAPI or tool modules.
+Up Next — Week 1, Day 5–6
+app/api/tickets.py, app/api/runs.py, app/api/approvals.py — all 7 FastAPI endpoints
+app/guardrails/intent_validator.py, app/guardrails/output_validator.py, app/guardrails/tool_authorizer.py, app/guardrails/response_grounder.py — remaining 4 guardrail types
+app/auth/session.py — extend base-version session auth for V1
+tests/test_guardrails.py — all 5 guardrail types, at least 2 cases each
