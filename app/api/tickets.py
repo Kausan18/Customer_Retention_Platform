@@ -11,6 +11,8 @@ from datetime import datetime, timezone, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
+from app.agents.order_status import order_status_graph
+from app.agents.order_tracking import order_tracking_graph
 from app.auth.session import require_session
 from app.db.database import execute, fetch_one
 from app.schemas.ticket import TicketCreate, TicketResponse
@@ -81,6 +83,59 @@ def create_ticket(
 # POST /tickets/{ticket_id}/runs
 # ---------------------------------------------------------------------------
 
+def run_workflow(ticket: dict, run_id: str, customer_id: str) -> dict | None:
+    """
+    Dispatches to the correct LangGraph workflow based on ticket category.
+    order_tracking and order_status run synchronously via graph.invoke()
+    and complete within the request. refund and exchange still use the
+    Week 1 stub until Day 4 replaces it with interrupt/resume graphs.
+    """
+    category = ticket["category"]
+
+    if category in ("order_tracking", "order_status"):
+        initial_state = {
+            "customer_id": customer_id,
+            "ticket_id": ticket["id"],
+            "run_id": run_id,
+            "customer_message": ticket["summary"],
+            "order_id": ticket.get("order_id"),
+            "order": None,
+            "response": None,
+            "error": None,
+            "final_status": None,
+        }
+
+        if category == "order_tracking":
+            initial_state["shipment"] = None
+            result_state = order_tracking_graph.invoke(
+                initial_state,
+                config={"configurable": {"thread_id": run_id}},
+            )
+        else:
+            initial_state["payment"] = None
+            result_state = order_status_graph.invoke(
+                initial_state,
+                config={"configurable": {"thread_id": run_id}},
+            )
+
+        final_status = result_state.get("final_status", "escalated")
+        run_status = "completed" if final_status == "resolved" else "failed"
+
+        execute(
+            "UPDATE workflow_runs SET status = ?, completed_at = ? WHERE id = ?",
+            (run_status, datetime.now(timezone.utc).isoformat(), run_id),
+        )
+
+        return {
+            "run_status": run_status,
+            "final_response": result_state.get("response"),
+        }
+
+    # The stub signature takes run_id, ticket, and the proposal timestamp.
+    _create_stub_proposal(run_id, ticket, _now_iso())
+    return None
+
+
 @router.post(
     "/{ticket_id}/runs",
     response_model=WorkflowRunResponse,
@@ -142,13 +197,7 @@ def start_run(
         payload={"ticket_id": ticket_id, "category": ticket["category"]},
     )
 
-    # ------------------------------------------------------------------
-    # TODO (Week 2): Replace this stub with LangGraph dispatch.
-    # The stub creates a realistic pending proposal + approval record
-    # so Checkpoint 3 can exercise the full approval API cycle.
-    # ------------------------------------------------------------------
-    _create_stub_proposal(run_id, ticket, now)
-    # ------------------------------------------------------------------
+    run_workflow(ticket, run_id, customer_id)
 
     return WorkflowRunResponse(
         run_id=run_id,

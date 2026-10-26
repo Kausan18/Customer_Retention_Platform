@@ -676,16 +676,311 @@ All four checkpoints passed:
 
 ---
 
-### Notes for Week 2
+## Session 4 — Week 2, Day 1–2: Tools, LangGraph Graphs, and Checkpoint 5
 
-- `mock_services/__init__.py` must exist before any tool module imports from
-  `mock_services` — add at the start of Week 2 if not present
-- The stub `_create_stub_proposal` block in `tickets.py` is the exact insertion
-  point for LangGraph dispatch, clearly marked `TODO (Week 2)`
-- `workflow_runs` double-write (`running` → `completed`) in the approval
-  endpoint is intentional for Checkpoint 3 only — Week 2 removes the second
-  write and lets LangGraph set `completed` after execution
-- `C211710` is the correct demo customer for all curl examples — owns `ord_0167`
-- Up next: `order_tracking_graph` and `order_status_graph` — the two simpler
-  LangGraph graphs with no interrupt/resume, right entry point for learning
-  LangGraph state and tool calls before tackling the refund workflow
+**Date:** 2026-10-27
+**Status:** ✅ Checkpoint 5 passed
+
+---
+
+### Goal
+
+Build the first two live LangGraph workflows — `order_tracking_graph` and
+`order_status_graph` — wire them into FastAPI, and verify end-to-end that a
+"where is my order?" complaint produces a grounded natural language response
+sourced from real DB records.
+
+---
+
+### Context
+
+Session 3 left a fully working HTTP API layer with all 5 guardrail types,
+7 endpoints, and a stub `_create_stub_proposal()` that simulated the refund
+cycle without any LLM or LangGraph involvement. The entire Week 1 foundation
+— schema, seed data, mock services, eligibility logic, auth, and guardrails —
+was verified and green before a single LangGraph node was written.
+
+Week 2 Day 1–2 replaces the stub dispatch path for `order_tracking` and
+`order_status` with real graphs. `refund` and `exchange` continue using the
+stub until Day 4.
+
+---
+
+### Step 1 — `mock_services/__init__.py`
+
+Empty file added to make `mock_services/` a proper Python package. Required
+before any tool module does `from mock_services.X import ...`. Noted in
+Session 3 as a must-do before Week 2 — done first.
+
+---
+
+### Step 2 — `app/tools/order_tools.py`
+
+Four read-only SQL functions:
+
+| Function | Purpose |
+|---|---|
+| `get_order(order_id, customer_id)` | Ownership-enforcing order lookup. Returns same error for not-found and wrong-owner — never reveals which |
+| `get_recent_orders(customer_id, limit)` | Most recent N orders for a customer, newest first. Used when no order_id is stated |
+| `get_shipment(order_id)` | Shipment record for an already-ownership-verified order |
+| `get_payment_status(order_id)` | Payment record for an already-ownership-verified order |
+
+All return `{"success": bool, ...}` structured dicts. No exceptions for expected
+failure paths — graph nodes read `result["success"]` to route. Parameterized
+SQL throughout, no user input interpolated into queries.
+
+`get_shipment` and `get_payment_status` do not re-check `customer_id` because
+ownership is already established by `get_order` in the same node — doing it
+twice would be redundant and would require passing `customer_id` into tools
+that have no business needing it.
+
+---
+
+### Step 3 — `app/tools/shipping_tools.py`
+
+Thin wrapper around `mock_services/shipping_service.py`. Normalizes the
+service response to the standard `{"success": bool, ...}` contract so graph
+nodes don't need to know whether they're talking to SQLite or a mock HTTP
+service.
+
+Not wired into the graphs today — `order_tracking_graph` uses `get_shipment()`
+from `order_tools.py` (direct SQLite, simpler, no failure-mode simulation
+needed for a status explanation). `shipping_tools.get_tracking_info()` exists
+for when mock service failure modes are demoed inside the tracking graph later.
+
+---
+
+### Step 4 — `app/tools/ticket_tools.py`
+
+One write tool used by every graph:
+
+`update_ticket(ticket_id, status, note, customer_id)` — ownership-checked
+write. Verifies `tickets.customer_id = ?` before updating. Called at the end
+of every graph on both the success and error paths.
+
+---
+
+### Step 5 — `app/services/gemini_client.py` (extracted from `app/main.py`)
+
+`GeminiChatClient` was previously defined inline in `app/main.py` for the
+base-version shopping chatbot. It had a hardcoded system instruction about
+purchase summaries in its `answer()` method. When LangGraph nodes called
+`call_gemini(prompt)`, this instruction overrode the 4-part structured prompt
+entirely — Gemini responded with shopping summary format regardless of what
+the prompt said.
+
+**Fix:** Extracted `GeminiChatClient` into `app/services/gemini_client.py`
+and added a new `raw_completion(prompt)` method that sends the prompt as a
+plain user message with no system instruction — the 4-part prompt is fully
+self-contained and controls Gemini's behavior directly.
+
+The module-level `call_gemini(prompt)` convenience wrapper now uses
+`raw_completion()`. The existing `answer()` method is untouched — the
+base-version `ShoppingChatbot` still uses it via the same import path.
+
+Both graph files import from `app.services.gemini_client`. No new `app/llm/`
+folder was created — `app/services/` is the correct home per the V1 file
+structure.
+
+---
+
+### Step 6 — `app/agents/order_tracking.py`
+
+First live LangGraph graph. Five nodes, two conditional edges:
+
+| Node | Type | What it does |
+|---|---|---|
+| `resolve_order_id_node` | code | If order_id in state use it, else fetch most recent order |
+| `fetch_facts` | code | `get_order()` + `get_shipment()`, sets error on failure |
+| `explain_status` | LLM | 4-part prompt → Gemini → validates against `TrackingExplanationOutput` schema, re-prompts once on failure |
+| `update_ticket_node` | code | `update_ticket()` → resolved, logs `workflow_completed` audit event |
+| `handle_error` | code | `update_ticket()` → escalated, logs `workflow_error` with error code, sets safe generic response |
+
+Edge routing:
+START → resolve_order_id_node
+resolve_order_id_node → fetch_facts | handle_error
+fetch_facts → explain_status | handle_error
+explain_status → update_ticket_node | handle_error
+update_ticket_node → END
+handle_error → END
+
+
+Uses `MemorySaver()` checkpointer with `thread_id = run_id`. No
+interrupt/resume — this graph only reads data and generates a response.
+Checkpointer pattern established now so Day 4's refund graph can reuse it
+without retrofitting.
+
+Output schema: `class TrackingExplanationOutput(BaseModel): explanation: str`
+
+---
+
+### Step 7 — `app/agents/order_status.py`
+
+Structurally identical to `order_tracking_graph`. Differences:
+
+| | order_tracking_graph | order_status_graph |
+|---|---|---|
+| Facts fetched | order + shipment | order + payment |
+| LLM node | `explain_status` | `summarize_status` |
+| Output schema | `TrackingExplanationOutput` | `StatusSummaryOutput` |
+| Prompt focus | Carrier, location, ETA | Order status + payment state |
+
+`resolve_order_id_node` logic is inlined in both graph files — no `_shared.py`
+module. That file was initially proposed but is not in the V1 build plan.
+~10 lines of duplication at V1 scope is acceptable; DRY matters more in V2
+with 5 graphs.
+
+---
+
+### Step 8 — `app/schemas/workflow_state.py` update
+
+Added `final_response: Optional[str] = None` to `WorkflowRunResponse`. Sourced
+from `tickets.summary` via a JOIN in `runs.py`. `update_ticket_node` in each
+graph writes the LLM response to `tickets.summary` via `update_ticket()` —
+so polling `GET /runs/{run_id}` returns the agent's response in the same call
+without needing a second `GET /tickets/{ticket_id}` request.
+
+---
+
+### Step 9 — `app/api/runs.py` update
+
+`GET /runs/{run_id}` query updated to JOIN `tickets` and return
+`tickets.summary AS final_response`. Ownership check unchanged — still
+verifies `tickets.customer_id = authenticated_customer_id`.
+
+---
+
+### Step 10 — `app/api/tickets.py` update
+
+`run_workflow(ticket, run_id, customer_id)` dispatcher added above the
+`POST /tickets/{ticket_id}/runs` endpoint:
+
+- `order_tracking` → builds initial state with `shipment: None`, invokes
+  `order_tracking_graph`
+- `order_status` → builds initial state with `payment: None`, invokes
+  `order_status_graph`
+- Both pass `config={"configurable": {"thread_id": run_id}}` — thread ID
+  is the stable `workflow_runs.id` already persisted in DB
+- After `invoke`, reads `final_status` from result state, sets
+  `workflow_runs.status` to `completed` or `failed` accordingly
+- `refund` / `exchange` fall through to `_create_stub_proposal()` unchanged
+
+`load_environment()` moved to module level in `app/main.py` (before
+`app = FastAPI(...)`) so `.env` is loaded when Uvicorn imports the module,
+not only when `main()` is called from the terminal. Second call inside
+`main()` retained — harmless because `os.environ.setdefault` never
+overwrites existing values.
+
+---
+
+### Issues Encountered and Resolutions
+
+**Issue 1: `app/llm/` folder referenced in graph imports**
+
+Initial graph files imported `from app.llm.gemini_client import call_gemini`.
+That folder was never in the V1 build plan.
+
+**Fix:** Extracted `GeminiChatClient` into `app/services/gemini_client.py`
+(correct location per V1 file structure). Both graph files updated to import
+from `app.services.gemini_client`.
+
+**Issue 2: `_shared.py` not in V1 build plan**
+
+`app/agents/_shared.py` was proposed to avoid duplicating `resolve_order_id`
+logic. Flagged as a deviation from the build plan.
+
+**Fix:** Removed `_shared.py`. Inlined `resolve_order_id_node` logic directly
+in both graph files. Import of `get_recent_orders` moved into each graph file's
+own tools import line.
+
+**Issue 3: Wrong Gemini model name**
+
+`call_gemini()` fallback had `gemini-1.5-flash`. Agreed model is
+`gemini-3.5-flash-lite`.
+
+**Fix:** Updated default in `call_gemini()`:
+```python
+model = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+```
+
+**Issue 4: HTTP 500 on POST /tickets/{id}/runs — Gemini 403 Forbidden**
+
+Uvicorn process did not have `GEMINI_API_KEY` set. `load_environment()` was
+only called inside `main()` (the terminal entry point), not at module import
+time. When Uvicorn imported `app.main`, `.env` was never read.
+
+**Fix:** Added `load_environment(...)` call at module level in `app/main.py`,
+before `app = FastAPI(...)`. Uses `os.environ.setdefault` so it's idempotent.
+
+**Issue 5: OUTPUT_VALIDATION_FAILED — Gemini returning shopping summary format**
+
+Graph reached Gemini successfully but `explain_status` node escalated with
+`error_code: OUTPUT_VALIDATION_FAILED`. Debug prints revealed:
+[DEBUG] raw gemini response: ‘Purchase Summary\nTotal purchases: 0\n...’
+
+
+`GeminiChatClient.answer()` contains a hardcoded system instruction for the
+shopping chatbot ("Use a short heading and one fact per line. Answer only about
+the customer's purchases..."). The 4-part structured prompt was being passed
+as the user message, but the system instruction controlled Gemini's output
+format — the shopping chatbot instruction won.
+
+**Fix:** Added `raw_completion(prompt)` method to `GeminiChatClient` that
+sends the prompt as a plain user message with no system instruction.
+`call_gemini()` wrapper updated to use `raw_completion()`. After the fix:
+
+[DEBUG] raw gemini response: ‘{“explanation”: “Hello! Your order has been
+delivered by BlueDart on October 23, 2026. ...”}’
+
+
+Valid JSON, correct schema key, grounded data. Debug prints removed before
+final checkpoint run.
+
+---
+
+### Checkpoint 5 — Verified Output
+
+**Curl sequence (C211710, category: order_tracking, message: "where is my order?"):**
+
+| Step | Request | Result |
+|---|---|---|
+| 1 | POST /auth/login | HTTP 200 — token, customer_id: C211710 |
+| 2 | POST /tickets | HTTP 201 — tkt_86983944, category: order_tracking |
+| 3 | POST /tickets/tkt_86983944/runs | HTTP 201 — run_96fc4b41, graph executed |
+| 4 | GET /runs/run_96fc4b41 | HTTP 200 — status: completed, final_response populated |
+
+**Step 4 full response:**
+```json
+{
+  "run_id": "run_96fc4b41",
+  "ticket_id": "tkt_86983944",
+  "thread_id": "91643ed9-73fe-46e9-bdce-ecd44f9a7d10",
+  "status": "completed",
+  "started_at": "2026-10-26T20:44:13.628333Z",
+  "completed_at": "2026-10-26T20:44:14.849695+00:00",
+  "final_response": "Hello! Your order has been delivered by BlueDart on October 23, 2026."
+}
+```
+
+**Grounding verified:**
+- Carrier `BlueDart` — from `shipments.carrier` in DB ✅
+- Date `October 23, 2026` — from `shipments.last_updated` or `orders.delivered_at` in DB ✅
+- No hallucinated tracking numbers, locations, or dates ✅
+- No shopping chatbot bleed-through ✅
+- Workflow completed in ~1.2 seconds ✅
+
+---
+
+### Notes for Next Session — Week 2, Day 3
+
+- RAG pipeline next: `rag/embedder.py`, `rag/retriever.py`,
+  `scripts/ingest_policies.py`, `app/tools/policy_tools.py`
+- Write all 5 policy `.md` files in `policies/` before ingestion
+- Checkpoint 6: `python scripts/ingest_policies.py` runs cleanly,
+  manual query "what is the refund window?" returns correct chunk
+  with correct citation
+- `order_status_graph` not yet curl-tested — Checkpoint 5 only covers
+  `order_tracking`. Run a quick smoke test with `category: order_status`
+  at the start of Day 3 before touching RAG
+- `shipping_tools.get_tracking_info()` built but not wired into any
+  graph yet — available for failure-mode demos when needed
