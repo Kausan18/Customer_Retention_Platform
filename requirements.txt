@@ -1,3 +1,6 @@
 fastapi==0.162.0
 pydantic==2.14.1
 pytest==9.1.1
+langgraph==1.2.14
+langgraph-checkpoint==4.2.0
+uvicorn==0.41.0

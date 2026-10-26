@@ -17,7 +17,15 @@ def _get_run_with_ownership(run_id: str, customer_id: str) -> dict:
     """Fetch a run and verify it belongs to the authenticated customer."""
     run = fetch_one(
         """
-        SELECT wr.*, t.customer_id AS ticket_customer_id
+        SELECT
+            wr.id,
+            wr.ticket_id,
+            wr.thread_id,
+            wr.status,
+            wr.started_at,
+            wr.completed_at,
+            t.summary AS final_response,
+            t.customer_id AS ticket_customer_id
         FROM workflow_runs wr
         JOIN tickets t ON t.id = wr.ticket_id
         WHERE wr.id = ?
@@ -50,6 +58,7 @@ def get_run(
         status=run["status"],
         started_at=run["started_at"],
         completed_at=run["completed_at"],
+        final_response=run["final_response"],
     )
 
 
