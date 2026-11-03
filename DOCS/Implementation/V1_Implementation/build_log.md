@@ -971,16 +971,179 @@ final checkpoint run.
 
 ---
 
-### Notes for Next Session — Week 2, Day 3
+## Session 5 — Week 2, Day 3: RAG Pipeline and Checkpoint 6
 
-- RAG pipeline next: `rag/embedder.py`, `rag/retriever.py`,
-  `scripts/ingest_policies.py`, `app/tools/policy_tools.py`
-- Write all 5 policy `.md` files in `policies/` before ingestion
-- Checkpoint 6: `python scripts/ingest_policies.py` runs cleanly,
-  manual query "what is the refund window?" returns correct chunk
-  with correct citation
-- `order_status_graph` not yet curl-tested — Checkpoint 5 only covers
-  `order_tracking`. Run a quick smoke test with `category: order_status`
-  at the start of Day 3 before touching RAG
-- `shipping_tools.get_tracking_info()` built but not wired into any
-  graph yet — available for failure-mode demos when needed
+**Date:** 2026-10-28
+**Status:** ✅ Checkpoint 6 passed
+
+---
+
+### Goal
+
+Build the full RAG pipeline — policy documents, chunking, embedding, storage,
+retrieval — and wire it into the existing chatbot so policy questions can be
+tested interactively before the refund and exchange graphs consume it in Day 4.
+
+---
+
+### Context
+
+Session 4 left two live LangGraph graphs (order_tracking, order_status),
+a verified Gemini client using raw_completion() for graph nodes, and the
+base-version shopping chatbot still intact. Session 5 adds the retrieval
+layer that the refund and exchange workflows depend on, and validates it
+end-to-end through both a programmatic retrieval test and live chatbot queries.
+
+---
+
+### Step 1 — Policy documents (policies/*.md)
+
+Five synthetic policy files written covering the five topics the V1 refund
+and exchange workflows require:
+
+| File | Document ID | Key rule |
+|---|---|---|
+| refund_policy_v1.md | refund_policy_v1 | 30-day refund window from delivery |
+| exchange_policy_v1.md | exchange_policy_v1 | 15-day exchange window, same category |
+| return_processing_v1.md | return_processing_v1 | Inspection within 3–5 days of receipt |
+| damaged_item_policy_v1.md | damaged_item_policy_v1 | Report within 7 days, photo required |
+| shipping_delay_policy_v1.md | shipping_delay_policy_v1 | Delay = 3+ days past estimated delivery |
+
+Each file uses a consistent four-section structure: Overview, Eligibility
+Conditions, Process, Exceptions. The `Document ID:` metadata line in the
+header block is parsed by `chunk_document()` to derive the stable document
+identifier used in citations.
+
+Initial drafts had generic Overview sections that matched too broadly at
+query time (top retrieval score 0.5011). Policy text was updated so the
+Overview states the key rule explicitly and Eligibility Conditions contains
+the exact terminology a customer would use. After the update, top retrieval
+score for "what is the refund window?" rose to 0.6577.
+
+---
+
+### Step 2 — rag/embedder.py
+
+Two functions:
+
+`chunk_document(filepath)` — reads a policy .md file, parses the header
+block for Document ID / Version / Effective date, splits on `##` headings,
+returns (chunks, meta). Each chunk carries document_id, section_id
+(slugified heading), content, and char_count. Chunks under 50 characters
+are skipped. Raises ValueError with a clear message if Document ID is
+missing from the header or no valid sections are found.
+
+`embed_chunks(texts)` — lazy-loads sentence-transformers all-MiniLM-L6-v2
+as a module-level singleton, encodes texts with normalize_embeddings=True
+so cosine similarity reduces to dot product, returns plain Python float
+lists (not numpy arrays) for JSON serialization.
+
+---
+
+### Step 3 — rag/retriever.py
+
+`search_policy(query, top_k=3, filters=None)` — embeds the query, fetches
+all policy_chunks rows from SQLite (filtered by document_id if provided),
+deserializes each stored embedding from JSON blob, computes dot product
+against query vector, sorts descending, returns top K as structured passages
+with document, section, and similarity_score.
+
+Returns standard success/failure contract matching all other V1 tool
+outputs. Failure cases: empty query, no rows in table, embedding call
+failure.
+
+Embedding storage: JSON-encoded float list stored as SQLite BLOB.
+No external vector database — brute-force dot product over ~20 chunks
+is instant at V1 scale. pgvector migration is deferred to V2 with
+PostgreSQL.
+
+---
+
+### Step 4 — rag/ingest_policies.py
+
+Standalone idempotent ingestion script. Creates policy_documents and
+policy_chunks tables if they don't exist, then for each .md file in
+policies/: deletes existing chunks and document record, re-ingests fresh
+chunks and embeddings. Entire ingestion runs in one transaction via
+get_connection() context manager.
+
+Run with: python rag/ingest_policies.py
+
+---
+
+### Step 5 — app/tools/policy_tools.py
+
+Thin wrapper: `search_policy_tool(query, document_id=None)` calls
+retriever's search_policy() and passes through its result dict unchanged.
+Graph nodes import from here, not from rag/ directly, so retriever
+signature changes only touch this file.
+
+---
+
+### Step 6 — Policy RAG path in app/main.py
+
+Added _is_policy_question(text) keyword router and answer_policy_question()
+function to app/main.py. In ShoppingChatbot.answer(), the policy path is
+checked before the existing order-data path: if the message contains a
+policy keyword and no order ID pattern (ord_\d+), the question is routed
+to answer_policy_question() which calls search_policy_tool(), builds a
+grounded prompt from retrieved passages, and calls call_gemini(). The
+existing order-data flow is completely unchanged.
+
+Known minor issue: the policy path returns call_gemini() output directly
+without passing through clean_response(). Bullet and numbered list
+formatting appears in terminal output. Will be fixed before the Streamlit
+demo.
+
+---
+
+### Checkpoint 6 — Verified Output
+
+**Ingestion:**
+=== Policy Ingestion Results ===
+OK | damaged_item_policy_v1: 4 chunks ingested
+OK | exchange_policy_v1: 4 chunks ingested
+OK | refund_policy_v1: 4 chunks ingested
+OK | return_processing_v1: 4 chunks ingested
+OK | shipping_delay_policy_v1: 4 chunks ingested
+
+Total chunks across all documents: 20
+
+
+**Retrieval test (query: "what is the refund window?"):**
+success: True
+0.6577 | refund_policy_v1 | overview
+0.6426 | refund_policy_v1 | eligibility_conditions
+0.4701 | refund_policy_v1 | process
+
+### Overview
+The refund window is 30 days from delivery. Every refund requires
+inspection to pass and reviewer approval before money is returned.
+
+
+**Chatbot policy queries verified:**
+- "how are the delayed shipments handled?" → correct shipping delay policy
+- "will i get a refund after 15 days?" → correctly confirms within window,
+  states conditions
+- "will i get a refund after 31 days?" → correctly states 30-day limit,
+  does not fabricate eligibility
+- "what is the exchange window?" → correctly returns 15 days from delivery
+- "what if the item i received is damaged?" → correct damaged item process
+- "i need to exchange my item, how do i do it?" → correct exchange process
+  with same-category and reviewer approval conditions
+
+All responses grounded in retrieved policy passages. No hallucinated facts.
+
+---
+
+### Notes for Next Session — Week 2, Day 4
+
+- Build refund_workflow_graph and exchange_workflow_graph with
+  interrupt/resume
+- Wire search_policy_tool into both graphs at the retrieve_policy node
+- Replace _create_stub_proposal() in tickets.py with real graph dispatch
+  for refund and exchange categories
+- Checkpoint 7: full refund cycle with real LLM — complaint → agent
+  proposes → reviewer approves via API → mock payment called → ticket
+  updated → grounded response returned
+

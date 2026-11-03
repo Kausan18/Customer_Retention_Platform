@@ -4,6 +4,7 @@ import csv
 import hmac
 import json
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -17,6 +18,7 @@ from app.api import tickets, runs, approvals
 from app.auth.session import create_session, invalidate_session
 from app.db.database import fetch_one
 from app.services.gemini_client import GeminiChatClient, call_gemini
+from app.tools.policy_tools import search_policy_tool
 import hmac, os
 from pydantic import BaseModel
 
@@ -73,6 +75,88 @@ def load_environment(path: Path = ENV_FILE) -> None:
 def prompt_demo_pin() -> str:
     """Read the PIN using standard terminal input, which works in VS Code terminals."""
     return input("Demo PIN [1234]: ").strip()
+
+
+POLICY_KEYWORDS = {
+    # Refund-related
+    "refund", "refunds", "money back", "reimbursement", "reimburse",
+    "refund window", "refund policy", "refund eligible", "refund eligibility",
+
+    # Return-related
+    "return", "returns", "returning", "send back", "ship back",
+    "return window", "return policy", "return process", "return status",
+    "received", "return received",
+
+    # Exchange-related
+    "exchange", "exchanges", "swap", "swapping", "replace", "replacement",
+    "exchange window", "exchange policy", "exchange eligible",
+    "different item", "another item", "switch",
+
+    # Stock and availability
+    "stock", "out of stock", "in stock", "available", "availability",
+    "not available", "unavailable",
+
+    # Inspection-related
+    "inspection", "inspect", "inspected", "passed inspection",
+    "failed inspection", "inspection status", "inspection result",
+
+    # Damaged item
+    "damaged", "damage", "broken", "defective", "faulty", "fault",
+    "not working", "doesnt work", "doesn't work", "stopped working",
+    "photo", "evidence", "proof", "image", "picture",
+
+    # Shipping and delay
+    "delay", "delayed", "delays", "late", "overdue", "shipping delay",
+    "shipping", "shipment", "delivery delay", "not delivered", "missing",
+    "estimated delivery", "expected delivery", "tracking",
+
+    # Approval and process
+    "approval", "approve", "approved", "reviewer", "review",
+    "how long", "how do i", "what happens", "what is the process",
+    "steps", "procedure", "process",
+
+    # Eligibility and conditions
+    "eligible", "eligibility", "qualify", "qualified", "conditions",
+    "requirements", "criteria", "allowed", "can i", "am i",
+
+    # Policy general
+    "policy", "policies", "rule", "rules", "terms", "guideline", "guidelines",
+    "window", "days", "deadline", "time limit", "within",
+
+    # Compensation and resolution
+    "compensation", "compensate", "store credit", "credit",
+    "resolution", "resolve", "resolved", "outcome",
+
+    # Escalation
+    "escalate", "escalation", "human", "supervisor", "manager",
+}
+
+
+def _is_policy_question(text: str) -> bool:
+    lower = text.lower()
+    has_policy_keyword = any(kw in lower for kw in POLICY_KEYWORDS)
+    has_order_id = bool(re.search(r"\bord_\d+\b", lower))
+    return has_policy_keyword and not has_order_id
+
+
+def answer_policy_question(question: str) -> str:
+    result = search_policy_tool(question)
+    if not result.get("success") or not result.get("passages"):
+        return "I don't have policy information for that question."
+    passages_text = "\n\n".join(
+        f"[{p['document']} / {p['section']}]\n{p['content']}"
+        for p in result["passages"]
+    )
+    prompt = (
+        "You are a customer support agent. Answer the customer's question using "
+        "only the policy passages below. Do not add any facts not present in the "
+        "passages. If the passages do not answer the question, say so.\n\n"
+        f"Customer question: {question}\n\n"
+        f"Policy passages:\n{passages_text}\n\n"
+        "Answer:"
+    )
+    #return call_gemini(prompt)
+    return clean_response(call_gemini(prompt))
 
 
 class ShoppingDatabase:
@@ -291,6 +375,10 @@ class ShoppingChatbot:
         self.audit.log(customer_id, "input_screen", decision.action, decision.reason)
         if decision.action == "BLOCK":
             return decision, "I can't help with that request."
+        if _is_policy_question(decision.text):
+            response = answer_policy_question(decision.text)
+            self.audit.log(customer_id, "policy_question", "answered", "policy_rag_path")
+            return decision, response
         if not is_supported_question(decision.text):
             self.audit.log(customer_id, "request_validation", "BLOCK", "unsupported_topic")
             return (
