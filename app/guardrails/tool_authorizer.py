@@ -31,12 +31,6 @@ class AuthorizationResult:
     proposal: dict | None = None  # Populated on success for caller convenience
 
 
-def _compute_hash(payload: dict) -> str:
-    """Compute SHA256 of the canonical JSON representation of a payload."""
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode()).hexdigest()
-
-
 def authorize_execution(proposal_id: str) -> AuthorizationResult:
     """
     Run all 5 authorization checks for a proposal before execution.
@@ -50,7 +44,11 @@ def authorize_execution(proposal_id: str) -> AuthorizationResult:
     """
     # Check 1: Proposal exists
     proposal = fetch_one(
-        "SELECT * FROM action_proposals WHERE id = ?",
+        """
+        SELECT id, run_id, action_type, payload, payload_hash, status, expires_at
+        FROM action_proposals
+        WHERE id = ?
+        """,
         (proposal_id,),
     )
     if proposal is None:
@@ -110,17 +108,16 @@ def authorize_execution(proposal_id: str) -> AuthorizationResult:
         )
 
     # Check 6: Payload hash must match (tamper detection)
-    try:
-        current_payload = json.loads(proposal["payload"])
-    except (json.JSONDecodeError, TypeError):
+    raw_payload_string = proposal["payload"]
+    if not isinstance(raw_payload_string, str):
         return AuthorizationResult(
             authorized=False,
             error_code="PAYLOAD_PARSE_ERROR",
             message="Could not parse proposal payload for hash verification.",
         )
 
-    computed_hash = _compute_hash(current_payload)
-    if computed_hash != proposal["payload_hash"]:
+    recomputed = hashlib.sha256(raw_payload_string.encode()).hexdigest()
+    if recomputed != proposal["payload_hash"]:
         return AuthorizationResult(
             authorized=False,
             error_code="PAYLOAD_TAMPERED",
@@ -130,7 +127,19 @@ def authorize_execution(proposal_id: str) -> AuthorizationResult:
             ),
         )
 
+    try:
+        current_payload = json.loads(raw_payload_string)
+    except (json.JSONDecodeError, TypeError):
+        return AuthorizationResult(
+            authorized=False,
+            error_code="PAYLOAD_PARSE_ERROR",
+            message="Could not parse proposal payload after hash verification.",
+        )
+
     return AuthorizationResult(
         authorized=True,
-        proposal={**current_payload, "proposal_id": proposal_id},
+        proposal=proposal,
     )
+
+
+check_authorization = authorize_execution

@@ -1,13 +1,11 @@
 # app/api/tickets.py
 """
 POST /tickets       — create a support ticket
-POST /tickets/{id}/runs — start a resolution workflow (stubbed for Checkpoint 3)
+POST /tickets/{id}/runs — start a resolution workflow
 """
 
-import hashlib
-import json
 import uuid
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
@@ -19,11 +17,103 @@ from app.schemas.ticket import TicketCreate, TicketResponse
 from app.schemas.workflow_state import WorkflowRunResponse
 from app.services import audit
 
+from langgraph.types import Command  # noqa: F401 — imported here for clarity
+from app.agents.refund_workflow import refund_workflow_graph
+from app.agents.exchange_workflow import exchange_workflow_graph
+
 router = APIRouter(prefix="/tickets", tags=["tickets"])
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _build_initial_refund_state(ticket: dict, run_id: str, customer_id: str) -> dict:
+    return {
+        "run_id": run_id,
+        "ticket_id": ticket["id"],
+        "customer_id": customer_id,
+        "order_id": ticket.get("order_id"),
+        "complaint_message": ticket.get("summary") or "",
+        "order": None,
+        "payment": None,
+        "return_record": None,
+        "policy_passages": None,
+        "eligibility_result": None,
+        "proposal_id": None,
+        "reviewer_decision": None,
+        "execution_result": None,
+        "error_code": None,
+        "error_message": None,
+        "final_response": None,
+    }
+
+
+def _build_initial_exchange_state(ticket: dict, run_id: str, customer_id: str) -> dict:
+    return {
+        "run_id": run_id,
+        "ticket_id": ticket["id"],
+        "customer_id": customer_id,
+        "order_id": ticket.get("order_id"),
+        "complaint_message": ticket.get("summary") or "",
+        "order": None,
+        "payment": None,
+        "policy_passages": None,
+        "eligibility_result": None,
+        "catalog_results": None,
+        "selected_replacement": None,
+        "proposal_id": None,
+        "reviewer_decision": None,
+        "execution_result": None,
+        "error_code": None,
+        "error_message": None,
+        "final_response": None,
+    }
+
+
+def _run_graph_and_update_status(
+    graph, initial_state: dict, run_id: str, ticket_id: str
+) -> None:
+    """
+    Invoke a LangGraph graph, check whether it paused at an interrupt or
+    completed, and update workflow_runs.status accordingly.
+    """
+    run_data = fetch_one(
+        "SELECT thread_id FROM workflow_runs WHERE id = ? AND ticket_id = ?",
+        (run_id, ticket_id),
+    )
+    if run_data is None:
+        raise RuntimeError(f"Workflow run {run_id} was not found for ticket {ticket_id}.")
+
+    config = {"configurable": {"thread_id": run_data["thread_id"]}}
+
+    try:
+        result = graph.invoke(initial_state, config=config)
+        graph_state = graph.get_state(config)
+
+        if graph_state.next:
+            execute(
+                "UPDATE workflow_runs SET status = 'paused' WHERE id = ?",
+                (run_id,),
+            )
+        else:
+            error_code = result.get("error_code")
+            final_status = "failed" if error_code else "completed"
+            execute(
+                "UPDATE workflow_runs SET status = ?, completed_at = ? WHERE id = ?",
+                (final_status, datetime.now(timezone.utc).isoformat(), run_id),
+            )
+    except Exception as exc:
+        execute(
+            "UPDATE workflow_runs SET status = 'failed', completed_at = ? WHERE id = ?",
+            (datetime.now(timezone.utc).isoformat(), run_id),
+        )
+        audit.log_event(
+            run_id=run_id,
+            actor="system",
+            event_type="workflow_exception",
+            payload={"error": str(exc)},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -87,8 +177,8 @@ def run_workflow(ticket: dict, run_id: str, customer_id: str) -> dict | None:
     """
     Dispatches to the correct LangGraph workflow based on ticket category.
     order_tracking and order_status run synchronously via graph.invoke()
-    and complete within the request. refund and exchange still use the
-    Week 1 stub until Day 4 replaces it with interrupt/resume graphs.
+    and complete within the request. Refund and exchange may pause while
+    waiting for reviewer approval.
     """
     category = ticket["category"]
 
@@ -131,8 +221,14 @@ def run_workflow(ticket: dict, run_id: str, customer_id: str) -> dict | None:
             "final_response": result_state.get("response"),
         }
 
-    # The stub signature takes run_id, ticket, and the proposal timestamp.
-    _create_stub_proposal(run_id, ticket, _now_iso())
+    elif category == "refund":
+        initial = _build_initial_refund_state(ticket, run_id, customer_id)
+        _run_graph_and_update_status(refund_workflow_graph, initial, run_id, ticket["id"])
+
+    elif category == "exchange":
+        initial = _build_initial_exchange_state(ticket, run_id, customer_id)
+        _run_graph_and_update_status(exchange_workflow_graph, initial, run_id, ticket["id"])
+
     return None
 
 
@@ -150,11 +246,8 @@ def start_run(
 
     Ownership check: ticket must belong to the authenticated customer.
 
-    For Checkpoint 3, the LangGraph workflow is STUBBED:
-    - Creates a workflow_run row with status=running
-    - Creates a stub action_proposal + approval row so the approval
-      endpoints can be tested end-to-end
-    - Week 2 replaces the stub block with actual LangGraph dispatch
+    Creates a workflow run row and dispatches to the graph for the
+    ticket's category.
     """
     # Ownership check
     ticket = fetch_one(
@@ -198,63 +291,21 @@ def start_run(
     )
 
     run_workflow(ticket, run_id, customer_id)
+    run_data = fetch_one(
+        "SELECT status, completed_at FROM workflow_runs WHERE id = ?",
+        (run_id,),
+    )
+    if run_data is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Workflow run not found after dispatch.",
+        )
 
     return WorkflowRunResponse(
         run_id=run_id,
         ticket_id=ticket_id,
         thread_id=thread_id,
-        status="running",
+        status=run_data["status"],
         started_at=now,
-    )
-
-
-def _create_stub_proposal(run_id: str, ticket: dict, now: str) -> None:
-    """
-    Checkpoint 3 stub: create a pending proposal + approval record.
-    Only called for refund/exchange categories — other categories get no proposal.
-    The proposal payload mirrors what the real LangGraph refund node will produce.
-    """
-    if ticket["category"] not in ("refund", "exchange"):
-        return
-
-    proposal_id = f"prp_{uuid.uuid4().hex[:8]}"
-    approval_id = f"apr_{uuid.uuid4().hex[:8]}"
-    expires_at = (
-        datetime.now(timezone.utc) + timedelta(hours=24)
-    ).isoformat().replace("+00:00", "Z")
-
-    # Build a realistic payload
-    payload = {
-        "action": f"request_{ticket['category']}_approval",
-        "order_id": ticket["order_id"] or "ord_stub",
-        "amount_minor": 1409500,  # ₹14,095 — matches ord_0167 for Checkpoint 3 demo
-        "currency": "INR",
-        "reason": "Checkpoint 3 stub — return received and inspection passed",
-        "evidence_refs": ["stub_return_001"],
-        "policy_refs": ["refund_policy_v1:section_2"],
-        "missing_information": [],
-    }
-    payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    payload_hash = hashlib.sha256(payload_json.encode()).hexdigest()
-
-    execute(
-        """
-        INSERT INTO action_proposals (id, run_id, action_type, payload, payload_hash, status, created_at, expires_at)
-        VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
-        """,
-        (proposal_id, run_id, ticket["category"], payload_json, payload_hash, now, expires_at),
-    )
-
-    execute(
-        """
-        INSERT INTO approvals (id, proposal_id, reviewer_id, decision, decided_at, created_at)
-        VALUES (?, ?, 'pending_reviewer', NULL, NULL, ?)
-        """,
-        (approval_id, proposal_id, now),
-    )
-
-    # Pause the run waiting for approval
-    execute(
-        "UPDATE workflow_runs SET status = 'paused' WHERE id = ?",
-        (run_id,),
+        completed_at=run_data["completed_at"],
     )

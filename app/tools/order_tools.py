@@ -103,3 +103,32 @@ def get_payment_status(order_id: str) -> dict:
             "message": "No payment record exists for this order.",
         }
     return {"success": True, "payment": dict(row)}
+
+
+def get_return_status(order_id: str) -> dict:
+    """
+    Retrieve the most recent return record for an order.
+    Call only after ownership has been established via get_order().
+    No customer_id check — ownership is established by the caller in the same node.
+    """
+    row = fetch_one(
+        "SELECT id, order_id, status, reason, received_at, inspection_status "
+        "FROM returns WHERE order_id = ? ORDER BY id DESC LIMIT 1",
+        (order_id,)
+    )
+    if not row:
+        return {
+            "success": False,
+            "error_code": "RETURN_NOT_FOUND",
+            "retryable": False,
+            "message": "No return record found for this order."
+        }
+    return {
+        "success": True,
+        "return_id": row["id"],
+        "order_id": row["order_id"],
+        "status": row["status"],
+        "reason": row["reason"],
+        "received_at": row["received_at"],
+        "inspection_status": row["inspection_status"]
+    }
