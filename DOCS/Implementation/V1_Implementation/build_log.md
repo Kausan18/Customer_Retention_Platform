@@ -1147,3 +1147,58 @@ All responses grounded in retrieved policy passages. No hallucinated facts.
   proposes → reviewer approves via API → mock payment called → ticket
   updated → grounded response returned
 
+
+## Session 6 — Week 2, Day 4: Refund and Exchange Workflows, Checkpoint 7
+
+**Date:** 2026-11-11
+**Status:** ✅ Checkpoint 7 passed
+
+### Goal
+Build refund_workflow_graph and exchange_workflow_graph with LangGraph interrupt/resume,
+wire all tool layers, and replace _create_stub_proposal() entirely for refund and
+exchange categories.
+
+### What was built
+- app/tools/order_tools.py: added get_return_status()
+- app/tools/payment_tools.py: new file — create_refund_proposal(), execute_approved_refund()
+- app/tools/catalog_tools.py: new file — search_catalog(), create_exchange_proposal(), execute_approved_exchange()
+- app/agents/refund_workflow.py: full LangGraph graph, 11 nodes, interrupt/resume at await_approval_node
+- app/agents/exchange_workflow.py: full LangGraph graph, same pattern, search_catalog_node added, no payment service call
+- app/api/tickets.py: replaced _create_stub_proposal() with _run_graph_and_update_status() dispatcher
+- app/api/approvals.py: added _resume_workflow() — resumes correct graph via Command(resume=...) after decision stored
+
+### Key design decisions
+- create_proposal_node and await_approval_node are separate nodes so proposal_id is
+  checkpointed before interrupt() fires. On resume the state already has proposal_id.
+- MemorySaver is a module-level singleton — shared across API calls within the same process.
+  Server restart between POST /runs and POST /approvals/decision loses checkpoint state.
+  Noted as V1 limitation; V2 uses PostgreSQL-based checkpointer.
+- execute_approved_refund uses idempotency_key = "refund_{proposal_id}" — stable and
+  deterministic, safe to retry.
+- execute_approved_exchange creates new order records; no payment service call for V1.
+
+### Issues encountered and resolutions
+- Issue 1: approvals.py hash check re-serialized payload with json.loads+json.dumps,
+  producing different bytes than original. Fix: hash the raw payload string from the DB
+  column directly without deserializing.
+- Issue 2: tool_authorizer.py returned auth.proposal without "payload" and "run_id"
+  columns. payment_tools.py accessed proposal["payload"] and got KeyError on resume.
+  Fix: return dict(row) from the full DB row so all columns including payload and run_id
+  are present.
+- Issue 3: Windows terminal encoding error on rupee symbol in step 7 output. Harmless —
+  purely a PowerShell display issue. API response, DB state, and graph execution all correct.
+
+### Checkpoint 7 — verified output
+- Ticket: tkt_80e29708
+- Run: run_34006b22
+- Approval: apr_078e97ad
+- Final run status: completed
+- Final response: confirms Rs.14,095 refund was submitted to payment provider
+- Audit trail: ticket_created, workflow_started, proposal_created, proposal_approved,
+  refund_executed, workflow_completed — all present in order
+
+### Notes for next session — Week 2, Day 5
+- Build order_placement_graph (Day 5 target)
+- Fix answer_policy_question() in app/main.py: wrap return in clean_response() before Streamlit demo
+- Smoke test exchange workflow with ord_0009, C211710 before Day 6 evals
+- MemorySaver limitation must be documented in README as known V1 constraint

@@ -15,6 +15,10 @@ from app.db.database import execute, fetch_one, fetch_all
 from app.schemas.approval import ApprovalDecision, ApprovalResponse
 from app.services import audit
 
+from langgraph.types import Command
+from app.agents.refund_workflow import refund_workflow_graph
+from app.agents.exchange_workflow import exchange_workflow_graph
+
 router = APIRouter(prefix="/approvals", tags=["approvals"])
 
 # ---------------------------------------------------------------------------
@@ -41,6 +45,60 @@ def _require_reviewer(x_reviewer_pin: str = Header(..., alias="X-Reviewer-Pin"))
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _resume_workflow(approval_id: str, decision: str) -> None:
+    """
+    Look up the run linked to this approval, resume the matching LangGraph graph,
+    and update workflow_runs.status based on completion.
+    Called after the approval decision is stored in the DB.
+    """
+    run_data = fetch_one(
+        """
+        SELECT workflow_runs.id AS run_id, workflow_runs.thread_id, tickets.category
+        FROM approvals
+        JOIN action_proposals
+            ON approvals.proposal_id = action_proposals.id
+        JOIN workflow_runs
+            ON action_proposals.run_id = workflow_runs.id
+        JOIN tickets
+            ON workflow_runs.ticket_id = tickets.id
+        WHERE approvals.id = ?
+        """,
+        (approval_id,),
+    )
+
+    if not run_data:
+        return
+
+    category = run_data["category"]
+    if category == "refund":
+        graph = refund_workflow_graph
+    elif category == "exchange":
+        graph = exchange_workflow_graph
+    else:
+        return
+
+    run_id = run_data["run_id"]
+    config = {"configurable": {"thread_id": run_data["thread_id"]}}
+
+    try:
+        graph.invoke(Command(resume={"decision": decision}), config=config)
+        graph_state = graph.get_state(config)
+        final_status = "paused" if graph_state.next else "completed"
+    except Exception as exc:
+        final_status = "failed"
+        audit.log_event(
+            run_id=run_id,
+            actor="system",
+            event_type="workflow_resume_exception",
+            payload={"error": str(exc)},
+        )
+
+    execute(
+        "UPDATE workflow_runs SET status = ?, completed_at = ? WHERE id = ?",
+        (final_status, datetime.now(timezone.utc).isoformat(), run_id),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -146,13 +204,13 @@ def submit_decision(
 
     # 2. Approval record
     approval = fetch_one(
-        "SELECT * FROM approvals WHERE id = ?",
+        "SELECT * FROM approvals WHERE approvals.id = ?",
         (approval_id,),
     )
     if approval is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Approval record not found.",
+            detail="Approval record not found",
         )
     if approval["decision"] is not None:
         raise HTTPException(
@@ -191,8 +249,7 @@ def submit_decision(
             detail="Could not parse proposal payload.",
         )
 
-    canonical = json.dumps(current_payload, sort_keys=True, separators=(",", ":"))
-    computed_hash = hashlib.sha256(canonical.encode()).hexdigest()
+    computed_hash = hashlib.sha256(proposal["payload"].encode()).hexdigest()
     if computed_hash != proposal["payload_hash"]:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -215,23 +272,7 @@ def submit_decision(
         (new_proposal_status, proposal["id"]),
     )
 
-    # Update workflow run status
-    if body.decision == "approved":
-        # Signal LangGraph resume (Week 2 wires the actual resume call here)
-        execute(
-            "UPDATE workflow_runs SET status = 'running' WHERE id = ?",
-            (proposal["run_id"],),
-        )
-        # For Checkpoint 3 stub: mark completed immediately since no real graph
-        execute(
-            "UPDATE workflow_runs SET status = 'completed', completed_at = ? WHERE id = ?",
-            (now, proposal["run_id"]),
-        )
-    else:
-        execute(
-            "UPDATE workflow_runs SET status = 'completed', completed_at = ? WHERE id = ?",
-            (now, proposal["run_id"]),
-        )
+    _resume_workflow(approval_id, body.decision)
 
     audit.log_event(
         run_id=proposal["run_id"],
@@ -244,11 +285,21 @@ def submit_decision(
         },
     )
 
+    run_data = fetch_one(
+        "SELECT status FROM workflow_runs WHERE id = ?",
+        (proposal["run_id"],),
+    )
+    if run_data is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Linked workflow run not found after processing the decision.",
+        )
+
     return ApprovalResponse(
         approval_id=approval_id,
         proposal_id=proposal["id"],
         decision=body.decision,
         reviewer_id=body.reviewer_id,
         decided_at=now,
-        run_status="completed",
+        run_status=run_data["status"],
     )
