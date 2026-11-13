@@ -10,6 +10,10 @@ import json
 import secrets
 from datetime import datetime, timezone, timedelta
 
+import uuid
+from datetime import datetime, timezone
+from app.db.database import get_connection, fetch_one, fetch_all
+
 from app.db.database import fetch_one, fetch_all, execute
 from app.guardrails.tool_authorizer import check_authorization
 from app.services.audit import log_event
@@ -245,3 +249,132 @@ def execute_approved_exchange(proposal_id: str, customer_id: str) -> dict:
         "tracking_id": tracking_id,
         "status": "exchange_created",
     }
+
+def place_order(customer_id: str, items: list[dict]) -> dict:
+    """
+    Creates a new order for the authenticated customer.
+
+    items: list of {"product_id": str, "quantity": int}
+
+    Writes atomically to orders, order_items, payments, shipments.
+    Prices are always re-read from product_catalog — never trusted
+    from the caller or from LLM output.
+
+    Returns:
+        {"success": True, "order_id": ..., "total_minor": ..., "items": [...]}
+        or
+        {"success": False, "error_code": ..., "message": ...}
+    """
+    if not items:
+        return {
+            "success": False,
+            "error_code": "NO_ITEMS",
+            "message": "No items were provided for the order.",
+        }
+
+    order_id = f"ord_{uuid.uuid4().hex[:8]}"
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    resolved_items = []
+    total_minor = 0
+
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+
+            # Resolve and validate each item against the live catalog
+            for item in items:
+                product_id = item.get("product_id")
+                quantity = item.get("quantity", 1)
+
+                if not product_id or quantity < 1:
+                    return {
+                        "success": False,
+                        "error_code": "INVALID_ITEM",
+                        "message": f"Invalid item payload: {item}",
+                    }
+
+                product = fetch_one(
+                    "SELECT id, name, category, price_minor, in_stock "
+                    "FROM product_catalog WHERE id = ?",
+                    (product_id,),
+                )
+
+                if product is None:
+                    return {
+                        "success": False,
+                        "error_code": "PRODUCT_NOT_FOUND",
+                        "message": f"Product {product_id} does not exist.",
+                    }
+
+                if not product["in_stock"]:
+                    return {
+                        "success": False,
+                        "error_code": "OUT_OF_STOCK",
+                        "message": f"Product {product['name']} is out of stock.",
+                    }
+
+                line_total = product["price_minor"] * quantity
+                total_minor += line_total
+
+                resolved_items.append({
+                    "order_item_id": f"oi_{uuid.uuid4().hex[:8]}",
+                    "product_id": product["id"],
+                    "product_name": product["name"],
+                    "category": product["category"],
+                    "quantity": quantity,
+                    "price_minor": product["price_minor"],
+                })
+
+            # Insert order
+            cur.execute(
+                "INSERT INTO orders (id, customer_id, status, currency, "
+                "total_minor, created_at, delivered_at) "
+                "VALUES (?, ?, 'confirmed', 'INR', ?, ?, NULL)",
+                (order_id, customer_id, total_minor, now),
+            )
+
+            # Insert order_items
+            for ri in resolved_items:
+                cur.execute(
+                    "INSERT INTO order_items (id, order_id, product_id, "
+                    "product_name, category, quantity, price_minor) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        ri["order_item_id"], order_id, ri["product_id"],
+                        ri["product_name"], ri["category"],
+                        ri["quantity"], ri["price_minor"],
+                    ),
+                )
+
+            # Insert payment
+            payment_id = f"pay_{uuid.uuid4().hex[:8]}"
+            cur.execute(
+                "INSERT INTO payments (id, order_id, status, amount_minor, "
+                "refunded_minor, payment_method, paid_at) "
+                "VALUES (?, ?, 'paid', ?, 0, 'mock_card', ?)",
+                (payment_id, order_id, total_minor, now),
+            )
+
+            # Insert shipment
+            shipment_id = f"shp_{uuid.uuid4().hex[:8]}"
+            cur.execute(
+                "INSERT INTO shipments (id, order_id, carrier, tracking_id, "
+                "status, estimated_delivery, last_updated) "
+                "VALUES (?, ?, NULL, NULL, 'processing', NULL, ?)",
+                (shipment_id, order_id, now),
+            )
+
+        return {
+            "success": True,
+            "order_id": order_id,
+            "total_minor": total_minor,
+            "items": resolved_items,
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error_code": "ORDER_CREATION_FAILED",
+            "message": str(e),
+        }
