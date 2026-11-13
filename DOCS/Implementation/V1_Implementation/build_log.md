@@ -1202,3 +1202,276 @@ exchange categories.
 - Fix answer_policy_question() in app/main.py: wrap return in clean_response() before Streamlit demo
 - Smoke test exchange workflow with ord_0009, C211710 before Day 6 evals
 - MemorySaver limitation must be documented in README as known V1 constraint
+
+
+## Session 7 — Week 2, Day 5: Order Placement Workflow and Checkpoint 8
+
+**Date:** 2026-11-13
+**Status:** ✅ Checkpoint 8 passed
+
+---
+
+### Goal
+
+Build `order_placement_graph` with a customer confirmation interrupt/resume
+loop, wire `POST /runs/{run_id}/messages`, and verify end-to-end that a
+natural language order request produces options, pauses for customer
+confirmation, creates an order, and completes.
+
+---
+
+### Context
+
+Sessions 1–6 left four workflows verified (order_tracking, order_status,
+refund, exchange). Session 7 adds the fifth and final workflow:
+order_placement. This is the only graph that pauses for a customer reply
+rather than a reviewer decision, requiring a new API endpoint and a
+different resume path from the refund/exchange interrupt pattern.
+
+Three carry-forward items from Session 6 were resolved before new code
+was written.
+
+---
+
+### Carry-Forward Items Closed
+
+**Exchange workflow smoke test**
+Passed with `ord_0149` / `C720914` after re-seeding. `ord_0009` from the
+original Session 6 note belonged to a different customer — the seed
+assigns customer-to-order mapping deterministically with fixed seed 42
+but fresh timestamps on every re-seed. Ineligible path also confirmed
+correct: a 20-day-old order routed to the ineligible branch with correct
+policy citation and no proposal created.
+
+**Audit event ordering fix**
+`proposal_approved` was being logged after `graph.invoke()` returned
+inside `_resume_workflow()` in `app/api/approvals.py`, so it appeared
+after `workflow_completed` in the event trail. Root cause: the audit
+write was placed after the graph resume call, not before it. Fix: moved
+`log_event("proposal_approved")` to before `graph.invoke()`. Initial
+diagnosis suspected the query ORDER BY clause, but `runs.py` already
+used `ORDER BY created_at ASC` — the ordering was correct. The actual
+fix was sequencing the write before the resume. Verified after fix:
+`proposal_approved` → `exchange_executed` → `workflow_completed`.
+
+**`clean_response()` in `answer_policy_question()`**
+Build log Session 5 noted this as a pending fix. Confirmed already
+implemented — `answer_policy_question()` already returns
+`clean_response(call_gemini(prompt))`. No change needed.
+
+---
+
+### Step 1 — `app/tools/catalog_tools.py`: `place_order()`
+
+**What:** Atomic write function that creates a complete order record for
+the authenticated customer. Writes `orders`, `order_items`, `payments`,
+and `shipments` in one transaction.
+
+**Why:** Every new order must have all four rows populated immediately so
+the tracking, status, and refund graphs can query it without null checks.
+Matching the seed pattern keeps the data consistent.
+
+**How:**
+- Prices always re-read from `product_catalog` by `product_id`. Any
+  price value a caller passes in is ignored — the server controls the
+  amount paid.
+- `in_stock = 1` enforced in code before writing.
+- New orders set to `status = confirmed` (pending → confirmed → shipped
+  → delivered lifecycle from V1 Section 5).
+- Order IDs generated as `ord_{uuid4().hex[:8]}` to avoid collision
+  with seeded `ord_XXXX` IDs.
+- Returns `{"success": True, "order_id": ..., "total_minor": ...,
+  "items": [...]}` or `{"success": False, "error_code": ...,
+  "message": ...}`.
+
+**Verified:** Manual call returned `success: True`, `total_minor: 499900`
+for `prod_003` (Smartwatch, Electronics, quantity 1).
+
+---
+
+### Step 2 — `app/schemas/workflow_state.py`: output schemas
+
+**What:** Added `CatalogOption`, `CatalogSearchOutput`, and
+`OrderConfirmationOutput` to the existing file. Existing
+`WorkflowRunResponse` and `WorkflowEvent` unchanged.
+
+**Why:** LLM nodes must return validated structures. `CatalogSearchOutput`
+caps presented options at 5 and validates that every returned `product_id`
+came from the `search_catalog()` result — not invented by the model.
+`OrderConfirmationOutput` carries a `needs_clarification` flag so
+ambiguous customer replies route to a clarifying error instead of
+silently defaulting to option 1.
+
+**Decision:** `OrderPlacementState` was not added here. Graph state is
+`TypedDict`, defined in the graph module. `workflow_state.py` is for
+API response schemas and LLM output schemas only.
+
+---
+
+### Step 3 — `app/agents/order_placement.py`
+
+**What:** Full LangGraph `StateGraph` with 9 nodes and an
+interrupt/resume loop for customer confirmation.
+
+**Nodes:**
+
+| Node | Type | Purpose |
+|---|---|---|
+| `classify_query_node` | code | Pass-through in V1 — natural language path only |
+| `search_catalog_node` | code | Calls `search_catalog()` with extracted keywords |
+| `present_options_node` | LLM | 4-part prompt → Gemini → `CatalogSearchOutput` validation |
+| `await_confirmation_node` | interrupt | Pauses graph, surfaces options to customer |
+| `validate_selection_node` | LLM | Interprets customer reply → `OrderConfirmationOutput` validation |
+| `create_order_node` | code | Calls `place_order()` — no LLM |
+| `final_response_node` | LLM | Order confirmation in natural language |
+| `update_ticket_node` | code | Sets ticket resolved, logs `workflow_completed` |
+| `handle_error_node` | code | Sets ticket escalated, logs `workflow_error`, returns safe message |
+
+**Key design decisions:**
+- `search_catalog_node` strips filler words from the customer message
+  before passing to `search_catalog()`. Passing the full sentence
+  ("I want to buy wireless headphones") as a LIKE query matched nothing.
+  Stripping stop words extracts "wireless headphones" which matches
+  `prod_001`.
+- `present_options_node` cross-checks every `product_id` the LLM returns
+  against `offered_product_ids` in state. An invented ID fails validation
+  before it can reach `place_order()`.
+- `validate_selection_node` sets `needs_clarification = True` when the
+  customer's reply doesn't map to an offered product. Routes to
+  `handle_error_node` rather than guessing.
+- `MemorySaver` instantiated at module level, same pattern as
+  `refund_workflow.py` and `exchange_workflow.py`.
+- `create_order_node` takes `customer_id` from authenticated state, never
+  from LLM output.
+
+---
+
+### Step 4 — `app/api/runs.py`: `POST /runs/{run_id}/messages`
+
+**What:** New endpoint that delivers the customer's confirmation reply to
+a paused `order_placement` workflow.
+
+**How:**
+- Auth: `Depends(require_session)` — verifies same customer owns the run
+- Returns 409 if `workflow_runs.status != 'paused'`
+- Returns 409 if `tickets.category != 'order_placement'`
+- Screens message through `inspect_request` before passing to graph
+- Resumes graph via `Command(resume=decision.text)` with same `thread_id`
+- Updates `workflow_runs.status` to `completed` or `failed` after invoke
+
+**Bug found and fixed:** Initial decorator was `@router.post(
+"/runs/{run_id}/messages")` but the router was already mounted with the
+`/runs` prefix in `main.py`. This registered the route at
+`/runs/runs/{run_id}/messages`, causing all calls to return 404. Fixed
+by changing decorator to `@router.post("/{run_id}/messages")`.
+
+---
+
+### Step 5 — `app/api/tickets.py`: dispatcher update
+
+**What:** Added `order_placement` branch to `run_workflow()`.
+
+**Key behavior:** Unlike refund and exchange which complete synchronously
+or pause for a reviewer, order_placement pauses for a customer reply.
+The dispatcher detects `__interrupt__` in the graph result, sets
+`workflow_runs.status = 'paused'`, and writes the options message to
+`tickets.summary` so `GET /runs/{run_id}` can return it as
+`final_response`.
+
+**Bug found and fixed:** `present_options_node` read `p["id"]` from
+catalog results but `search_catalog()` returns `product_id` as the key.
+This caused `KeyError: 'id'` inside the graph, which escaped
+`graph.invoke()` as an unhandled exception and returned HTTP 500. Fixed
+by changing `p["id"]` to `p["product_id"]`.
+
+Added try/except around `graph.invoke()` for the order_placement branch,
+matching the pattern used by refund and exchange dispatchers.
+
+---
+
+### Step 6 — `tests/test_order_placement.py` (new file, deviation from V1 structure)
+
+**What:** 5 unit tests for `place_order()`.
+
+| Test | What it verifies |
+|---|---|
+| `test_successful_order_creates_all_rows` | All four tables written, total correct |
+| `test_nonexistent_product_fails` | `PRODUCT_NOT_FOUND` returned, nothing written |
+| `test_out_of_stock_product_fails` | `OUT_OF_STOCK` returned |
+| `test_empty_items_fails` | `NO_ITEMS` returned |
+| `test_price_is_server_controlled_not_caller_supplied` | Catalog price used regardless of caller input |
+
+**Result:** `python -m pytest tests/test_order_placement.py -v` →
+5 passed in 0.17s.
+
+**Deviation:** V1 Section 11 structure lists `tests/test_tools.py` as
+the target file for tool tests. `test_order_placement.py` is a new
+standalone file. Consolidation into `test_tools.py` is deferred.
+
+---
+
+### Issues Encountered and Resolutions
+
+**Issue 1: Exchange smoke test used wrong customer for ord_0009**
+`ord_0009` was assigned to a different customer by the seed. The find
+script identified `C720914` / `ord_0149` as the eligible exchange case
+after re-seeding.
+
+**Issue 2: `ord_0042` ineligible after re-seed**
+After the first re-seed, `ord_0042` landed on a non-delivered order.
+Re-ran `find_eligible_exchange.py` to get a fresh eligible order.
+Root cause: re-seeding regenerates `delivered_at` timestamps from `now`,
+so any order IDs noted in prior sessions may not be eligible after a
+re-seed.
+
+**Issue 3: `search_catalog()` returning no results**
+`search_catalog_node` passed the full customer sentence to `search_catalog()`
+as a LIKE query. `LIKE '%i want to buy wireless headphones%'` matched no
+product names. Fix: added stop-word stripping in `search_catalog_node`
+to extract keywords before the search call.
+
+**Issue 4: `KeyError: 'id'` in `present_options_node`**
+`search_catalog()` returns dicts with key `product_id` but
+`present_options_node` read `p["id"]`. Fixed by changing to
+`p["product_id"]`.
+
+**Issue 5: `POST /runs/{run_id}/messages` returning 404**
+Router prefix duplication — decorator had full path `/runs/{run_id}/
+messages` but router was already mounted at `/runs`. Fixed decorator
+to `/{run_id}/messages`.
+
+**Issue 6: `final_response` blank in POST /tickets/{id}/runs response**
+Not a bug. The POST response for a paused run does not populate
+`final_response` — that field is intentionally only populated on
+`GET /runs/{run_id}` which reads `tickets.summary`. Copilot flagged it
+as a bug because it printed `$run.final_response` from the POST response.
+The options message was correctly persisted and available via GET.
+
+---
+
+### Checkpoint 8 — Verified Output
+
+| Step | Operation | Result |
+|---|---|---|
+| 1 | Login C211710 PIN 1234 | HTTP 200 — token returned |
+| 2 | POST /tickets — order_placement, "I want to buy wireless headphones" | HTTP 201 — tkt_8a0ff67d |
+| 3 | POST /tickets/tkt_8a0ff67d/runs | HTTP 201 — run_8527eaf4, status: paused |
+| 4 | GET /runs/run_8527eaf4 | HTTP 200 — final_response = options message |
+| 5 | POST /runs/run_8527eaf4/messages — "I'll take the first option" | HTTP 200 — status: completed |
+| 6 | GET /runs/run_8527eaf4 | HTTP 200 — status: completed, order ord_cea35770 confirmed |
+| 7 | Audit trail | ticket_created → workflow_started → order_created → workflow_completed |
+
+---
+
+### Notes for Next Session — Week 2, Day 6
+
+- Build `evals/eval_cases.json` — 30 cases across 5 groups
+- Build `evals/run_evals.py` — seeds scenario, runs workflow, asserts DB state
+- Run all 30 cases, record metrics
+- Checkpoint 9: all 30 cases run without crashing, results saved to
+  `evals/reports/v1_results.json`
+- New canonical test data after re-seed:
+  - Eligible exchange: `ord_0149` / `C720914`
+  - Eligible refund: run `find_eligible_exchange.py` equivalent for
+    refund to get fresh IDs before eval seeding
+- All 5 workflows now complete — eval harness covers all groups

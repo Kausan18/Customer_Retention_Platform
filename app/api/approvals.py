@@ -272,8 +272,6 @@ def submit_decision(
         (new_proposal_status, proposal["id"]),
     )
 
-    _resume_workflow(approval_id, body.decision)
-
     audit.log_event(
         run_id=proposal["run_id"],
         actor=body.reviewer_id,
@@ -284,6 +282,8 @@ def submit_decision(
             "action_type": proposal["action_type"],
         },
     )
+
+    _resume_workflow(approval_id, body.decision)
 
     run_data = fetch_one(
         "SELECT status FROM workflow_runs WHERE id = ?",

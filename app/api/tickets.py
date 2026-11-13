@@ -20,6 +20,7 @@ from app.services import audit
 from langgraph.types import Command  # noqa: F401 — imported here for clarity
 from app.agents.refund_workflow import refund_workflow_graph
 from app.agents.exchange_workflow import exchange_workflow_graph
+from app.agents.order_placement import order_placement_graph
 
 router = APIRouter(prefix="/tickets", tags=["tickets"])
 
@@ -228,6 +229,52 @@ def run_workflow(ticket: dict, run_id: str, customer_id: str) -> dict | None:
     elif category == "exchange":
         initial = _build_initial_exchange_state(ticket, run_id, customer_id)
         _run_graph_and_update_status(exchange_workflow_graph, initial, run_id, ticket["id"])
+
+    elif ticket["category"] == "order_placement":
+        initial_state = {
+            "run_id": run_id,
+            "ticket_id": ticket["id"],
+            "customer_id": customer_id,
+            "customer_message": ticket["summary"] or ticket.get("message", ""),
+        }
+        config = {"configurable": {"thread_id": run_id}}
+        try:
+            result = order_placement_graph.invoke(initial_state, config=config)
+        except Exception as e:
+            execute(
+                "UPDATE workflow_runs SET status = 'failed' WHERE id = ?",
+                (run_id,),
+            )
+            execute(
+                "UPDATE tickets SET status = 'escalated' WHERE id = ?",
+                (ticket["id"],),
+            )
+            audit.log_event(
+                run_id=run_id,
+                actor="system",
+                event_type="workflow_error",
+                payload=str(e),
+            )
+            raise HTTPException(status_code=500, detail=str(e))
+
+        # The graph pauses at await_confirmation_node via interrupt().
+        # LangGraph surfaces this as an __interrupt__ key in the result.
+        if "__interrupt__" in result:
+            print("Order placement interrupt payload:", result["__interrupt__"])
+            execute("UPDATE workflow_runs SET status = 'paused' WHERE id = ?", (run_id,))
+            interrupt_value = result["__interrupt__"][0].value
+            options_message = (
+                interrupt_value.get("message", "")
+                if isinstance(interrupt_value, dict)
+                else str(interrupt_value)
+            )
+            execute(
+                "UPDATE tickets SET summary = ? WHERE id = ?",
+                (options_message, ticket["id"]),
+            )
+        else:
+            final_status = "failed" if result.get("error_code") else "completed"
+            execute("UPDATE workflow_runs SET status = ? WHERE id = ?", (final_status, run_id))
 
     return None
 
