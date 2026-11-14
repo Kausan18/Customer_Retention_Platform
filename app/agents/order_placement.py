@@ -5,7 +5,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import interrupt, Command
 from langgraph.checkpoint.memory import MemorySaver
 
-from app.tools.catalog_tools import search_catalog, place_order
+from app.tools.catalog_tools import extract_catalog_keywords, search_catalog, place_order
 from app.tools.ticket_tools import update_ticket
 from app.services.audit import log_event
 from app.services.gemini_client import call_gemini
@@ -36,21 +36,22 @@ def classify_query_node(state: PlacementState) -> PlacementState:
 
 
 def search_catalog_node(state: PlacementState) -> PlacementState:
-    filler_words = {
-        "i", "want", "to", "buy", "a", "an", "the", "some", "get", "me",
-        "need", "looking", "for", "please", "can", "you", "find", "show",
-        "order", "purchase", "would", "like", "help",
-    }
-    query = " ".join(
-        word for word in state["customer_message"].lower().split()
-        if word not in filler_words
-    )
-    result = search_catalog(query=query or None)
+    keywords = extract_catalog_keywords(state["customer_message"])
+    query = " ".join(keywords)
+    result = search_catalog(query=query) if query else {"success": True, "products": []}
+    if not result.get("success") or not result.get("products"):
+        fallback_query = max(keywords, key=len, default="")
+        if fallback_query:
+            result = search_catalog(query=fallback_query)
+
     if not result.get("success") or not result.get("products"):
         return {
             **state,
-            "error_code": "NO_PRODUCTS_FOUND",
-            "error_message": "No matching products were found in the catalog.",
+            "error_code": "NO_CATALOG_RESULTS",
+            "error_message": (
+                "The requested product was not found in the catalog. "
+                "Please browse the available categories and let us know what you would like."
+            ),
         }
     return {**state, "catalog_results": result["products"]}
 
@@ -245,6 +246,30 @@ def update_ticket_node(state: PlacementState) -> PlacementState:
 
 
 def handle_error_node(state: PlacementState) -> PlacementState:
+    if state.get("error_code") == "NO_CATALOG_RESULTS":
+        safe_message = (
+            "I couldn't find that product in our catalog. You can browse the available "
+            "categories and let me know what you'd like."
+        )
+        update_ticket(
+            ticket_id=state["ticket_id"],
+            status="resolved",
+            note=safe_message,
+            customer_id=state["customer_id"],
+        )
+        log_event(
+            run_id=state["run_id"],
+            actor="system",
+            event_type="workflow_completed",
+            payload=json.dumps({"outcome": "product_not_found"}),
+        )
+        return {
+            **state,
+            "final_response": safe_message,
+            "error_code": None,
+            "error_message": None,
+        }
+
     safe_message = {
         "NO_PRODUCTS_FOUND": "I couldn't find any matching products in our catalog. A team member will follow up.",
         "SELECTION_UNCLEAR": "I couldn't tell which option you meant. Could you reply with the product name or number?",

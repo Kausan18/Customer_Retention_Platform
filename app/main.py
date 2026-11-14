@@ -7,8 +7,6 @@ import os
 import re
 import secrets
 import sqlite3
-import time
-from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +16,7 @@ from app.api import tickets, runs, approvals
 from app.auth.session import create_session, invalidate_session
 from app.db.database import fetch_one
 from app.services.gemini_client import GeminiChatClient, call_gemini
+from app.services.rate_limiter import rate_limiter
 from app.tools.policy_tools import search_policy_tool
 import hmac, os
 from pydantic import BaseModel
@@ -36,8 +35,6 @@ CSV_FILE = ROOT / "data" / "customer_shopping_data.csv" / "customer_shopping_dat
 DATABASE_FILE = ROOT / "data" / "customer_shopping.sqlite3"
 LOG_FILE = ROOT / "logs" / "guardrail_audit.jsonl"
 ENV_FILE = ROOT / ".env"
-RATE_LIMIT_REQUESTS = 8
-RATE_LIMIT_WINDOW_SECONDS = 60
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_GEMINI_TIMEOUT_SECONDS = 120
 EXPECTED_CSV_COLUMNS = (
@@ -308,21 +305,6 @@ class AuditLogger:
             log_file.write(json.dumps(entry) + "\n")
 
 
-class RateLimiter:
-    def __init__(self) -> None:
-        self.requests: dict[str, deque[float]] = defaultdict(deque)
-
-    def check(self, customer_id: str) -> bool:
-        now = time.monotonic()
-        requests = self.requests[customer_id]
-        while requests and now - requests[0] > RATE_LIMIT_WINDOW_SECONDS:
-            requests.popleft()
-        if len(requests) >= RATE_LIMIT_REQUESTS:
-            return False
-        requests.append(now)
-        return True
-
-
 @dataclass(frozen=True)
 class AuthenticatedSession:
     customer_id: str
@@ -344,7 +326,7 @@ class ShoppingChatbot:
         self.data = ShoppingDatabase(csv_path, database_path)
         self.demo_pin = demo_pin
         self.audit = AuditLogger()
-        self.limiter = RateLimiter()
+        self.limiter = rate_limiter
         self.client = GeminiChatClient(api_key, model, gemini_timeout_seconds)
         self._sessions: dict[str, str] = {}
 

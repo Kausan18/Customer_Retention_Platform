@@ -54,15 +54,14 @@ def validate_intent(
     normalized = raw_intent.strip().lower()
 
     # Guard: out-of-scope by keyword match on customer message
-    if normalized not in SUPPORTED_INTENTS:
-        msg_lower = customer_message.lower()
-        for keyword in _OUT_OF_SCOPE_KEYWORDS:
-            if keyword in msg_lower:
-                return GuardrailDecision(
-                    action="BLOCK",
-                    text=customer_message,
-                    reason="INTENT_OUT_OF_SCOPE",
-                )
+    msg_lower = customer_message.lower()
+    for keyword in _OUT_OF_SCOPE_KEYWORDS:
+        if keyword in msg_lower:
+            return GuardrailDecision(
+                action="BLOCK",
+                text=customer_message,
+                reason="INTENT_OUT_OF_SCOPE",
+            )
 
     # Guard: intent not in supported set
     if normalized not in SUPPORTED_INTENTS:

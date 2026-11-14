@@ -162,6 +162,7 @@ def list_pending_approvals(
             "run_id": row["run_id"],
             "action_type": row["action_type"],
             "payload": payload,
+            "created_at": row["proposal_created_at"],
             "expires_at": row["expires_at"],
             "ticket": {
                 "ticket_id": row["ticket_id"],

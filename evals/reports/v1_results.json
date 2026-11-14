@@ -1,0 +1,224 @@
+{
+  "run_at": "2026-11-14T14:15:18.263934+00:00",
+  "total": 30,
+  "passed": 27,
+  "failed": 0,
+  "skipped": 3,
+  "timed_out": 0,
+  "metrics": {
+    "verified_resolution_rate": 1.0,
+    "guardrail_precision": 1.0
+  },
+  "cases": [
+    {
+      "id": "EP-01",
+      "result": "PASS",
+      "reason": "ok",
+      "group": "order_placement",
+      "manual_review": false
+    },
+    {
+      "id": "EP-02",
+      "result": "PASS",
+      "reason": "ok",
+      "group": "order_placement",
+      "manual_review": false
+    },
+    {
+      "id": "EP-03",
+      "result": "PASS",
+      "reason": "ok",
+      "group": "order_placement",
+      "manual_review": false
+    },
+    {
+      "id": "EP-04",
+      "result": "PASS",
+      "reason": "ok",
+      "group": "order_placement",
+      "manual_review": true
+    },
+    {
+      "id": "EP-05",
+      "result": "PASS",
+      "reason": "blocked as expected | http_log=[('login', 200), ('create_ticket', 400)]",
+      "group": "order_placement",
+      "manual_review": false
+    },
+    {
+      "id": "ET-01",
+      "result": "PASS",
+      "reason": "ok",
+      "group": "order_tracking",
+      "manual_review": false
+    },
+    {
+      "id": "ET-02",
+      "result": "PASS",
+      "reason": "ok",
+      "group": "order_status",
+      "manual_review": false
+    },
+    {
+      "id": "ET-03",
+      "result": "PASS",
+      "reason": "blocked as expected | http_log=[('login', 200), ('create_ticket', 404)]",
+      "group": "order_status",
+      "manual_review": false
+    },
+    {
+      "id": "ET-04",
+      "result": "PASS",
+      "reason": "ok",
+      "group": "order_status",
+      "manual_review": false
+    },
+    {
+      "id": "ET-05",
+      "result": "PASS",
+      "reason": "blocked as expected | http_log=[('login', 200), ('create_ticket', 400)]",
+      "group": "order_status",
+      "manual_review": false
+    },
+    {
+      "id": "ER-01",
+      "result": "PASS",
+      "reason": "ok",
+      "group": "refund",
+      "manual_review": false
+    },
+    {
+      "id": "ER-02",
+      "result": "PASS",
+      "reason": "ok",
+      "group": "refund",
+      "manual_review": false
+    },
+    {
+      "id": "ER-03",
+      "result": "PASS",
+      "reason": "ok",
+      "group": "refund",
+      "manual_review": false
+    },
+    {
+      "id": "ER-04",
+      "result": "PASS",
+      "reason": "ok",
+      "group": "refund",
+      "manual_review": false
+    },
+    {
+      "id": "ER-05",
+      "result": "PASS",
+      "reason": "blocked as expected | http_log=[('login', 200), ('create_ticket', 400)]",
+      "group": "refund",
+      "manual_review": false
+    },
+    {
+      "id": "EX-01",
+      "result": "PASS",
+      "reason": "ok",
+      "group": "exchange",
+      "manual_review": false
+    },
+    {
+      "id": "EX-02",
+      "result": "PASS",
+      "reason": "ok",
+      "group": "exchange",
+      "manual_review": false
+    },
+    {
+      "id": "EX-03",
+      "result": "PASS",
+      "reason": "ok",
+      "group": "exchange",
+      "manual_review": true
+    },
+    {
+      "id": "EX-04",
+      "result": "PASS",
+      "reason": "ok",
+      "group": "exchange",
+      "manual_review": true
+    },
+    {
+      "id": "EX-05",
+      "result": "PASS",
+      "reason": "expired approval correctly rejected",
+      "group": "exchange",
+      "manual_review": false
+    },
+    {
+      "id": "GR-01",
+      "result": "PASS",
+      "reason": "blocked as expected | http_log=[('login', 200), ('create_ticket', 400)]",
+      "group": "guardrail",
+      "manual_review": false
+    },
+    {
+      "id": "GR-02",
+      "result": "PASS",
+      "reason": "blocked as expected | http_log=[('login', 200), ('create_ticket', 400)]",
+      "group": "guardrail",
+      "manual_review": false
+    },
+    {
+      "id": "GR-03",
+      "result": "PASS",
+      "reason": "blocked as expected | http_log=[('login', 200), ('create_ticket', 400)]",
+      "group": "guardrail",
+      "manual_review": false
+    },
+    {
+      "id": "GR-04",
+      "result": "PASS",
+      "reason": "blocked as expected | http_log=[('login', 200), ('create_ticket', 400)]",
+      "group": "guardrail",
+      "manual_review": false
+    },
+    {
+      "id": "GR-05",
+      "result": "PASS",
+      "reason": "blocked as expected | http_log=[('login', 200), ('create_ticket', 201), ('start_run', 400)]",
+      "group": "guardrail",
+      "manual_review": false
+    },
+    {
+      "id": "GR-06",
+      "result": "PASS",
+      "reason": "blocked as expected | http_log=[('login', 200), ('create_ticket', 201), ('start_run', 400)]",
+      "group": "guardrail",
+      "manual_review": false
+    },
+    {
+      "id": "GR-07",
+      "result": "SKIP",
+      "reason": "Requires forcing a malformed schema out of Gemini mid-run; already verified at the unit level in tests/test_guardrails.py::OutputValidatorTests (Checkpoint 4). Not independently reproducible through the public API.",
+      "group": "guardrail",
+      "manual_review": false
+    },
+    {
+      "id": "GR-08",
+      "result": "SKIP",
+      "reason": "Requires forcing a leaky LLM response; already verified at the unit level in tests/test_guardrails.py::ResponseGrounderTests (Checkpoint 4).",
+      "group": "guardrail",
+      "manual_review": false
+    },
+    {
+      "id": "GR-09",
+      "result": "SKIP",
+      "reason": "Requires forcing a premature confirmation claim from the LLM; already verified at the unit level in tests/test_guardrails.py::ResponseGrounderTests (Checkpoint 4).",
+      "group": "guardrail",
+      "manual_review": false
+    },
+    {
+      "id": "GR-10",
+      "result": "PASS",
+      "reason": "9th request rate-limited, earlier 8 succeeded",
+      "group": "guardrail",
+      "manual_review": false
+    }
+  ]
+}
