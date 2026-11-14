@@ -22,6 +22,8 @@ INJECTION_PATTERNS = (
     r"\b(database|table)\s+(schema|structure|contents?)\b",
     r"\b(what is|what's|show me|tell me|display)\b.{0,40}\b(system prompt|developer message|hidden instructions?)\b",
     r"\b(run|call|invoke|execute|trigger)\b.{0,40}\b(execute_|create_|get_|update_|search_)\w+",
+    r"\b(order|buy|purchase)\b.{0,30}\b(all|every|each|everything)\b",
+    r"\b(refund|return|exchange)\b.{0,30}\b(all|every|each|everything)\b.{0,30}(order|item|product)",
 )
 
 SUPPORTED_TOPICS = (
