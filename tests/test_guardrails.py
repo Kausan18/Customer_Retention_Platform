@@ -91,6 +91,20 @@ class IntentValidatorTests(unittest.TestCase):
         self.assertEqual(result.action, "BLOCK")
         self.assertEqual(result.reason, "INTENT_UNCLEAR")
 
+    def test_valid_category_with_out_of_scope_message_blocked(self):
+        result = self.validate("order_status", "What's the weather today?")
+        self.assertEqual(result.action, "BLOCK")
+        self.assertEqual(result.reason, "INTENT_OUT_OF_SCOPE")
+
+
+class RateLimiterTests(unittest.TestCase):
+    def test_ninth_request_within_window_is_blocked(self):
+        from app.services.rate_limiter import RateLimiter
+
+        limiter = RateLimiter()
+        self.assertTrue(all(limiter.check("eval-customer") for _ in range(8)))
+        self.assertFalse(limiter.check("eval-customer"))
+
 
 # ---------------------------------------------------------------------------
 # Test 3: Output Validator
@@ -150,10 +164,9 @@ class ToolAuthorizerTests(unittest.TestCase):
     """
 
     def setUp(self):
-        from app.guardrails.tool_authorizer import authorize_execution, _compute_hash
+        from app.guardrails.tool_authorizer import authorize_execution
         from app.db.database import execute
         self.authorize = authorize_execution
-        self.compute_hash = _compute_hash
         self.execute = execute
         self._created_ids: list[tuple[str, str]] = []  # (table, id)
 
@@ -186,8 +199,8 @@ class ToolAuthorizerTests(unittest.TestCase):
         self._created_ids.append(("workflow_runs", run_id))
 
         payload = {"order_id": "ord_0167", "amount_minor": 1409500, "reason": "test"}
-        payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-        payload_hash = self.compute_hash(payload) if not tamper else "badhash000"
+        payload_json = json.dumps(payload, separators=(",", ":"))
+        payload_hash = hashlib.sha256(payload_json.encode()).hexdigest() if not tamper else "badhash000"
 
         if expired:
             expires_at = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")

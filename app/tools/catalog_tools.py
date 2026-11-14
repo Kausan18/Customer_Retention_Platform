@@ -7,6 +7,7 @@ this is a straight swap tracked via order records.
 """
 import hashlib
 import json
+import re
 import secrets
 from datetime import datetime, timezone, timedelta
 
@@ -17,6 +18,18 @@ from app.db.database import get_connection, fetch_one, fetch_all
 from app.db.database import fetch_one, fetch_all, execute
 from app.guardrails.tool_authorizer import check_authorization
 from app.services.audit import log_event
+
+
+CATALOG_STOP_WORDS = frozenset({
+    "want", "need", "like", "have", "some", "that", "this", "with", "from",
+    "give", "show", "find", "look", "just", "also", "about", "order", "orders",
+    "please", "would", "could", "under", "below", "price",
+})
+
+
+def extract_catalog_keywords(message: str) -> list[str]:
+    words = re.findall(r"[a-zA-Z]{4,}", message.lower())
+    return list(dict.fromkeys(word for word in words if word not in CATALOG_STOP_WORDS))
 
 
 def _utcnow() -> str:
@@ -40,11 +53,27 @@ def search_catalog(
     if category:
         sql += " AND category = ?"
         params.append(category)
-    if query:
-        sql += " AND (LOWER(name) LIKE ? OR LOWER(category) LIKE ?)"
-        params.extend([f"%{query.lower()}%", f"%{query.lower()}%"])
-
-    sql += " ORDER BY id LIMIT 10"
+    query_terms = list(dict.fromkeys(re.findall(r"[a-zA-Z0-9]+", query.lower()))) if query else []
+    if query_terms:
+        term_matches = ["(LOWER(name) LIKE ? OR LOWER(category) LIKE ?)" for _ in query_terms]
+        sql += " AND (" + " OR ".join(term_matches) + ")"
+        params.extend(
+            value
+            for term in query_terms
+            for value in (f"%{term}%", f"%{term}%")
+        )
+        relevance = " + ".join(
+            "CASE WHEN LOWER(name) LIKE ? OR LOWER(category) LIKE ? THEN 1 ELSE 0 END"
+            for _ in query_terms
+        )
+        sql += f" ORDER BY ({relevance}) DESC, id LIMIT 10"
+        params.extend(
+            value
+            for term in query_terms
+            for value in (f"%{term}%", f"%{term}%")
+        )
+    else:
+        sql += " ORDER BY id LIMIT 10"
 
     rows = fetch_all(sql, tuple(params)) if params else fetch_all(sql, ())
 

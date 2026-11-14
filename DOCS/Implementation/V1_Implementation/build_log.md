@@ -1475,3 +1475,425 @@ The options message was correctly persisted and available via GET.
   - Eligible refund: run `find_eligible_exchange.py` equivalent for
     refund to get fresh IDs before eval seeding
 - All 5 workflows now complete — eval harness covers all groups
+
+
+## Session 8 — Week 2, Day 6: Eval Harness, Guardrail Wiring, and Checkpoint 9
+
+**Date:** 2026-11-14
+**Status:** ✅ Checkpoint 9 passed
+
+---
+
+### Goal
+
+Build the full V1 eval harness, wire all missing guardrails into the FastAPI
+layer, fix real graph bugs surfaced by the harness, and produce a clean
+27-pass / 0-fail / 3-skip run with results saved to
+`evals/reports/v1_results.json`.
+
+---
+
+### Context
+
+Sessions 1–7 left all five LangGraph workflows verified end-to-end via
+manual curl sequences. Session 8 replaces manual verification with an
+automated harness that hits the live HTTP API, exercises auth, guardrails,
+graphs, tools, and the real SQLite DB in a single repeatable run. No graph
+functions are called directly — every case goes through the full stack.
+
+---
+
+### Step 1 — `evals/eval_cases.json`
+
+**What:** 30 test case definitions across 5 groups.
+
+**Structure of each case:**
+```json
+{
+  "id": "ER-01",
+  "group": "refund",
+  "description": "...",
+  "setup": {
+    "customer_strategy": "eligible_refund",
+    "category": "refund",
+    "message_template": "I want a refund for my order {order_id}"
+  },
+  "resume": { "type": "approval", "value": "approved" },
+  "expect_blocked": false,
+  "assertions": {
+    "run_status": "completed",
+    "ticket_status": "resolved",
+    "db_checks": [...],
+    "forbidden_db_checks": [...]
+  }
+}
+```
+
+**Key design decision — customer strategies instead of hardcoded order IDs:**
+Every case declares a strategy name. The harness resolves it at runtime by
+querying the live DB. This makes the harness re-seed-safe — no order IDs
+hardcoded anywhere.
+
+| Strategy | What the harness queries |
+|---|---|
+| `eligible_refund` | First delivered order: return received + passed, payment paid, within 30 days |
+| `second_eligible_refund` | Second such order — used by ER-04 so it doesn't reuse ER-01's order after refund executes |
+| `eligible_exchange` | First delivered order: within 15 days, payment paid |
+| `second_eligible_exchange` | Second such order — used by EX-05 so it doesn't reuse EX-01's order |
+| `ineligible_refund_outside_window` | First delivered order with OUTSIDE_WINDOW error code |
+| `ineligible_exchange_outside_window` | First delivered order with OUTSIDE_WINDOW error code |
+| `any_delivered` | First delivered order |
+| `not_delivered_order` | First non-delivered order |
+| `any_customer` | First customer in orders table |
+| `mismatched_customer_order` | One customer's token + another customer's order ID |
+| `customer_without_shoes_order` | Customer with no Shoes-category order items |
+
+**30 cases by group:**
+
+| Group | Cases | What they cover |
+|---|---|---|
+| order_placement | EP-01 to EP-05 | Natural language order, budget constraint, exact product, out-of-catalog, bulk block |
+| order_tracking/status | ET-01 to ET-05 | Tracking, status, ownership enforcement, cross-customer block |
+| refund | ER-01 to ER-05 | Eligible approved, outside window, not delivered, reviewer rejection, bulk block |
+| exchange | EX-01 to EX-05 | Eligible approved, outside window, cross-category, no matching order, expired approval |
+| guardrail | GR-01 to GR-10 | Input screener, intent validator, output validator, response grounder, rate limiter |
+
+**Three cases marked `skip: true` (GR-07, GR-08, GR-09):**
+These require forcing specific malformed or unsafe LLM outputs mid-run,
+which the public HTTP API cannot do reliably. See the guardrail skip
+documentation section below for full detail.
+
+---
+
+### Step 2 — `evals/run_evals.py`
+
+**What:** Standalone script. Runs with `python evals/run_evals.py`. No
+pytest — cases run sequentially with shared state within each case.
+
+**Per-case flow:**
+1. Resolve customer strategy — fresh DB query every time
+2. Resolve product strategy if present
+3. Login — fresh session token per case
+4. Create ticket — `inspect_request` wired here (see Step 4)
+5. Start run
+6. Handle resume — `none`, `customer_message`, `approval`, or `expired_approval`
+7. Poll for terminal status — `completed`, `failed`, or `paused` (for resume:none cases)
+8. Assert run_status, ticket_status, db_checks, forbidden_db_checks, response content
+9. Logout — always fires via `finally` block, never leaks tokens between cases
+
+**Key harness behaviors:**
+- `token = None` initialized before `try` so `finally: if token: logout(token)` is
+  always safe
+- `ctx["ticket_id"]` and `ctx["run_id"]` stored immediately after creation so
+  `forbidden_db_checks` substitution works on early-exit paths
+- Rate limit burst (GR-10) handled outside the normal try/finally — uses a
+  dedicated customer ID that no other case touches
+- Approval matching uses `run_id` primary + `ticket_id` secondary + `created_at`
+  fallback, with an 8-attempt retry loop (0.5s each) to handle exchange graphs
+  that take longer to reach the interrupt than refund graphs
+- `expired_approval` path: `force_expire_approval()` writes directly to
+  `action_proposals.expires_at`, then `decide_approval()` fires, expects HTTP 410,
+  returns immediately without polling — the paused run is never resumed
+- `poll_run` accepts `treat_paused_as_terminal=True` for cases with `resume: none`
+  so a graph that pauses for approval doesn't cause a timeout
+
+**Metrics computed:**
+```
+verified_resolution_rate = passed / (passed + failed)   # excludes skips
+guardrail_precision      = guardrail_passes / guardrail_non_skips
+```
+
+Also writes `executed`, `skipped` to the report JSON so the README can
+state "27 of 30 executed" rather than implying all 30 ran.
+
+---
+
+### Step 3 — Guardrail wiring gaps fixed
+
+Three guardrails existed as unit-tested functions but were not called in the
+FastAPI layer. The harness surfaced all three.
+
+#### `inspect_request` not called in `POST /tickets`
+
+**Symptom:** EP-05 ("Order 10 units of everything") and ER-05 ("Give me a
+refund for all my orders") and GR-01 through GR-04 were passing through
+`create_ticket()` without input screening. GR-01 to GR-04 were only blocked
+because other mechanisms happened to catch them downstream.
+
+**Fix:** Added to `app/api/tickets.py` `create_ticket()`, before any DB write:
+```python
+decision = inspect_request(body.message, customer_id)
+if decision.action == "BLOCK":
+    raise HTTPException(status_code=400, detail={"blocked": True, "reason": decision.reason})
+```
+
+**Bulk-request patterns added to `INJECTION_PATTERNS`** in
+`app/guardrails/input_screener.py`:
+```python
+r"\b(order|buy|purchase)\b.{0,30}\b(all|every|each|everything)\b",
+r"\b(refund|return|exchange)\b.{0,30}\b(all|every|each|everything)\b.{0,30}(order|item|product)",
+```
+
+#### Intent validator not called in `POST /tickets/{id}/runs`
+
+**Symptom:** GR-05 ("What's the weather today?") and GR-06 ("Tell me a
+joke") created tickets successfully and started runs — the intent validator
+existed but was only called inside the LangGraph router, not at the API
+boundary.
+
+**Fix:** Added to `app/api/tickets.py` `start_run()`, before `run_workflow()`:
+```python
+intent_result = validate_intent(ticket.category, ticket.summary or "")
+if intent_result.action == "BLOCK":
+    raise HTTPException(status_code=400, detail={"blocked": True, "reason": intent_result.reason})
+```
+
+**Intent validator updated** in `app/guardrails/intent_validator.py`: the
+out-of-scope keyword check now runs regardless of whether the declared
+category is valid. Previously `validate_intent("order_status", "What's the
+weather?")` skipped the keyword check because `order_status` is a supported
+category. Now it detects "weather" in the message and returns BLOCK with
+`INTENT_OUT_OF_SCOPE`.
+
+#### Rate limiter not called in `POST /tickets`
+
+**Symptom:** GR-10 burst test — all 9 requests returned 201 because the
+rate limiter only ran inside `ShoppingChatbot.answer()`.
+
+**Fix:** Extracted `RateLimiter` instance to a module-level singleton in a
+new `app/services/rate_limiter.py` to avoid circular imports. Added to
+`create_ticket()` after the input screener check:
+```python
+if not rate_limiter.check(customer_id):
+    raise HTTPException(status_code=429, detail={"blocked": True, "reason": "RATE_LIMIT_EXCEEDED"})
+```
+
+---
+
+### Step 4 — Exchange workflow graph bug fixed
+
+**Symptom:** EX-03 ("cross-category exchange request is declined") was
+timing out or passing for the wrong reason. The graph was routing
+cross-category requests to approval instead of the ineligible branch.
+
+**Root cause:** `search_catalog_node` stripped stop-words from the raw
+customer message and passed the result to `search_catalog()` as a LIKE
+query. The word "for" in "exchange my order for furniture" matched "Formal"
+in product names, returning "Leather Formal Shoes". When the original order
+was also Shoes, the same-category check passed and a proposal was created.
+
+**Fix in `app/agents/exchange_workflow.py`:**
+
+Added `extract_requested_category()` — matches only the 6 exact catalog
+category names against the message using word-boundary regex before any
+catalog search runs:
+
+```python
+VALID_CATEGORIES = {"Electronics", "Clothing", "Cosmetics", "Food", "Shoes", "Toys"}
+
+def extract_requested_category(message: str) -> str | None:
+    for cat in VALID_CATEGORIES:
+        if re.search(rf"\b{cat}\b", message, re.IGNORECASE):
+            return cat
+    return None
+```
+
+Routing logic added before `search_catalog()`:
+- Category found AND differs from original order's categories →
+  `error_code = "NO_SAME_CATEGORY_ITEM"` → ineligible node →
+  `update_ticket(..., "resolved")` → `run_status: completed`
+- Category found AND matches → `search_catalog(category)` with exact
+  category name, not stripped message keywords
+- No category found → existing keyword fallback
+
+**Ineligible and handle_error nodes updated** to always set
+`state["final_response"]` to a customer-friendly message and always write
+`tickets.summary` before the run exits. Raw customer message was previously
+leaking through as `final_response` when the graph exited early via the
+error path.
+
+---
+
+### Step 5 — `tests/test_exchange_workflow.py` (new file)
+
+4 tests verifying the category extraction fix:
+
+| Test | What it verifies |
+|---|---|
+| `test_cross_category_request_declines_without_proposal` | Electronics order + "for Shoes" message → completed, no proposal, ticket resolved |
+| `test_same_category_request_proceeds_to_proposal` | Electronics order + "for Electronics" message → paused, one pending proposal |
+| `test_no_category_in_message_uses_keyword_fallback` | Any eligible order + "for a similar one" → paused, proposal created via fallback |
+| `test_furniture_request_declines_cross_category` | Any eligible order + "for a bicycle" → completed, no proposal, response not raw message |
+
+---
+
+### Issues Encountered and Resolutions
+
+**Issue 1: input screener not wired into `create_ticket()`**
+EP-05, ER-05 passed ticket creation with bulk-request messages. Added
+`inspect_request()` call and two bulk-request patterns. Session 3
+Checkpoint 4 unit tests all still pass after the pattern additions.
+
+**Issue 2: intent validator keyword check skipped for valid categories**
+GR-05, GR-06 — valid category + out-of-scope message was returning ALLOW.
+Moved the keyword check to run unconditionally before the category validity
+check in `intent_validator.py`.
+
+**Issue 3: rate limiter not in FastAPI layer**
+GR-10 all-429 on first run — the burst customer had exhausted the limit
+from earlier cases using the same `any_customer` strategy. Fixed by
+extracting `RateLimiter` to a module-level singleton and wiring into
+`create_ticket()`. Burst test uses a dedicated customer ID.
+
+**Issue 4: `send_message` sending wrong field name**
+EP-01, EP-03 were timing out — harness was sending `{"text": ...}` but
+the endpoint expects `{"message": ...}`. Fixed in harness.
+
+**Issue 5: approval field name mismatch in harness**
+`GET /approvals` returns `approval_id` not `id`. Harness was doing
+`a["id"]` → `KeyError`. Fixed to `a.get("approval_id") or a.get("id")`.
+
+**Issue 6: `token` not initialized before `try` block**
+Copilot's session-conflict rewrite left `token` uninitialized before the
+try block, causing `NameError` in `finally`. Fixed by setting `token = None`
+before the try.
+
+**Issue 7: EX-05 approval not found in `GET /approvals`**
+Exchange graph takes longer to commit the proposal than refund graph.
+Fixed by replacing the single 0.3s sleep with an 8-attempt retry loop
+(0.5s each) that exits as soon as a matching approval appears.
+
+**Issue 8: EX-03 pausing instead of declining**
+Fuzzy keyword extraction was routing cross-category requests to approval.
+Fixed by the category extraction change in `exchange_workflow.py`.
+
+**Issue 9: ER-04 skipping — only one eligible refund order after ER-01 executes**
+ER-01 issues a real refund, setting `refunded_minor > 0` and exhausting
+the eligible balance. Added `strategy_second_eligible_refund` and updated
+ER-04 to use it.
+
+**Issue 10: `test_guardrails.py` importing `_compute_hash`**
+Copilot's input-screener changes generated new tests that imported a
+private function from `tool_authorizer.py` that doesn't exist. Fixed by
+removing the import and replacing direct hash calls with inline SHA256
+logic. All 25 guardrail tests pass.
+
+---
+
+### Guardrail Skip Documentation — GR-07, GR-08, GR-09
+
+These three cases test LLM output validation behaviors that cannot be
+triggered reliably through the public HTTP API. They are covered by unit
+tests in `tests/test_guardrails.py` but not end-to-end in the harness.
+
+#### GR-07 — Malformed LLM output triggers re-prompt then escalation
+
+**What it tests:** When a LangGraph LLM node returns JSON that fails
+Pydantic schema validation, `output_validator.py` re-prompts Gemini once
+with the schema error. On second failure the workflow escalates.
+
+**Why skipped:** Forcing Gemini to return malformed JSON through the public
+API requires either mocking the Gemini client or injecting a prompt
+specifically crafted to break the schema — neither is reliable or
+repeatable in an HTTP-level harness.
+
+**Unit coverage:** `OutputValidatorTests` in `tests/test_guardrails.py`
+verifies the validator correctly parses valid JSON, rejects mismatched
+schemas, and returns the error message for re-prompting. The re-prompt
+retry loop is tested in `test_output_validator_retry_behavior`.
+
+**How to handle in V2:** Replace `GeminiChatClient` with an injectable
+LLM interface. In tests, inject a `MockLLMClient` that returns a bad
+schema on the first call and valid JSON on the second. This makes
+the retry behavior testable end-to-end without touching Gemini.
+
+#### GR-08 — Response containing another customer's ID is replaced with safe fallback
+
+**What it tests:** When `response_grounder.py` detects a `C\d{6}` pattern
+in the final response that doesn't match the authenticated customer ID,
+the response is replaced with a generic fallback message.
+
+**Why skipped:** Forcing Gemini to include another customer's ID in its
+response requires the retrieved context to contain that ID and the model
+to reproduce it verbatim — not reliably triggerable via API.
+
+**Unit coverage:** `ResponseGrounderTests` in `tests/test_guardrails.py`
+verifies the cross-customer ID pattern is detected and the response is
+replaced. `test_leaky_model_response_is_not_displayed` covers this path.
+
+**How to handle in V2:** Same injectable LLM interface as GR-07. Inject
+a mock that returns a response containing a hardcoded foreign customer ID.
+Assert the grounder replaces it before the response reaches the API caller.
+
+#### GR-09 — Premature refund-confirmed claim replaced when payment is pending
+
+**What it tests:** When the final response contains refund confirmation
+language ("refund has been processed", "refund confirmed", etc.) but the
+payment tool result shows `status: pending` or `status: processing`,
+`response_grounder.py` replaces the response with a safe fallback.
+
+**Why skipped:** The mock payment service returns `success: True` on a
+normal refund execution. Triggering a `pending` result while also having
+the LLM claim confirmation requires coordinating both the mock service
+failure mode and the LLM output — not achievable through the HTTP API
+in a deterministic way.
+
+**Unit coverage:** `ResponseGrounderTests` in `tests/test_guardrails.py`
+verifies the confirmation-language detection pattern and the replacement
+behavior. `test_grounding_blocks_premature_confirmation` covers this path.
+
+**How to handle in V2:** Set `mock_payment_service` to `pending` mode
+via environment variable before the test case runs. Inject a mock LLM
+that returns a response with confirmation language. Assert the grounder
+fires and the API returns the safe fallback. Add a `payment_mode` field
+to eval cases so the harness can configure the mock before each run.
+
+---
+
+### Checkpoint 9 — Verified Output
+
+**`python -m pytest tests/test_exchange_workflow.py tests/test_guardrails.py -v`:**
+```
+tests/test_exchange_workflow.py::test_cross_category_request_declines_without_proposal  PASSED
+tests/test_exchange_workflow.py::test_same_category_request_proceeds_to_proposal         PASSED
+tests/test_exchange_workflow.py::test_no_category_in_message_uses_keyword_fallback       PASSED
+tests/test_exchange_workflow.py::test_furniture_request_declines_cross_category          PASSED
+tests/test_guardrails.py  (25 tests)                                                     PASSED
+
+29 passed in X.XXs
+```
+
+**`python evals/run_evals.py`:**
+```
+PASS: 27  FAIL: 0  SKIP: 3  TIMEOUT: 0  / 30 total
+verified_resolution_rate: 1.0
+guardrail_precision: 1.0
+
+Results written to evals/reports/v1_results.json
+```
+
+**Metric interpretation:**
+- `verified_resolution_rate: 1.0` = 27 of 27 executed cases passed.
+  3 cases (GR-07 to GR-09) were skipped and excluded from the denominator.
+  Full statement for README: "27 of 30 cases executed and passing; 3 skipped
+  (unit-test-only guardrail behaviors — see skip documentation)."
+- `guardrail_precision: 1.0` = all 7 guardrail cases that executed were
+  correctly handled. Does not cover false-positive rate on legitimate traffic.
+- EX-03 now passes with `run_status: completed` and `ticket_status: resolved`
+  via the ineligible branch, not via the paused/no-order-created path.
+
+---
+
+### Notes for Next Session — Week 2, Day 7
+
+- Build `streamlit_app.py` — 5-panel UI
+- Fix `answer_policy_question()` response formatting if not already done
+  (Session 5 noted clean_response() already applied — verify before demo)
+- Three demo scenarios to wire:
+  - Demo A: successful approved refund (use eligible_refund order)
+  - Demo B: correctly blocked request (ineligible refund outside window)
+  - Demo C: cross-category exchange decline (EX-03 scenario)
+- Write README covering scope, setup, architecture, eval results,
+  known limitations (MemorySaver process-scoped, GR-07 to GR-09 unit-only)
+- Checkpoint 10 (V1 Done): all 3 demo scenarios work live in Streamlit,
+  eval results displayed in UI

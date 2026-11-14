@@ -16,6 +16,9 @@ from app.db.database import execute, fetch_one
 from app.schemas.ticket import TicketCreate, TicketResponse
 from app.schemas.workflow_state import WorkflowRunResponse
 from app.services import audit
+from app.guardrails.input_screener import inspect_request, GuardrailDecision
+from app.guardrails.intent_validator import validate_intent
+from app.services.rate_limiter import rate_limiter
 
 from langgraph.types import Command  # noqa: F401 — imported here for clarity
 from app.agents.refund_workflow import refund_workflow_graph
@@ -130,6 +133,18 @@ def create_ticket(
     Create a support ticket for the authenticated customer.
     customer_id is always derived from the session token — never from the body.
     """
+    decision = inspect_request(body.message, customer_id)
+    if decision.action == "BLOCK":
+        raise HTTPException(
+            status_code=400,
+            detail={"blocked": True, "reason": decision.reason},
+        )
+    if not rate_limiter.check(customer_id):
+        raise HTTPException(
+            status_code=429,
+            detail={"blocked": True, "reason": "RATE_LIMIT_EXCEEDED"},
+        )
+
     # If order_id provided, verify the order belongs to this customer
     if body.order_id:
         order = fetch_one(
@@ -305,6 +320,13 @@ def start_run(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Ticket not found or does not belong to this customer.",
+        )
+
+    intent_result = validate_intent(ticket["category"], ticket["summary"] or "")
+    if intent_result.action == "BLOCK":
+        raise HTTPException(
+            status_code=400,
+            detail={"blocked": True, "reason": intent_result.reason},
         )
 
     if ticket["status"] not in ("open", "in_progress"):
