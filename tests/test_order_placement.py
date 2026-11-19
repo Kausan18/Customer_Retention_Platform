@@ -2,6 +2,7 @@ import unittest
 import uuid
 from app.tools.catalog_tools import place_order
 from app.db.database import fetch_one, execute
+from mock_services import payment_service
 
 
 class PlaceOrderTests(unittest.TestCase):
@@ -16,27 +17,76 @@ class PlaceOrderTests(unittest.TestCase):
     def tearDown(self):
         for oid in self.created_order_ids:
             execute("DELETE FROM order_items WHERE order_id = ?", (oid,))
+            execute(
+                "DELETE FROM payment_transactions "
+                "WHERE payment_id IN (SELECT id FROM payments WHERE order_id = ?)",
+                (oid,),
+            )
             execute("DELETE FROM payments WHERE order_id = ?", (oid,))
             execute("DELETE FROM shipments WHERE order_id = ?", (oid,))
             execute("DELETE FROM orders WHERE id = ?", (oid,))
 
     def test_successful_order_creates_all_rows(self):
-        result = place_order(self.customer_id, [{"product_id": self.product_id, "quantity": 2}])
+        result = place_order(
+            self.customer_id,
+            [{"product_id": self.product_id, "quantity": 2}],
+            "UPI",
+        )
         self.assertTrue(result["success"])
         self.created_order_ids.append(result["order_id"])
 
         self.assertEqual(result["total_minor"], self.price_minor * 2)
+        self.assertEqual(result["payment_status"], "paid")
 
         order = fetch_one("SELECT * FROM orders WHERE id = ?", (result["order_id"],))
         self.assertIsNotNone(order)
+        self.assertEqual(order["status"], "confirmed")
         self.assertEqual(order["customer_id"], self.customer_id)
 
         payment = fetch_one("SELECT * FROM payments WHERE order_id = ?", (result["order_id"],))
         self.assertEqual(payment["status"], "paid")
+        self.assertEqual(payment["payment_method"], "UPI")
         self.assertEqual(payment["amount_minor"], result["total_minor"])
 
         shipment = fetch_one("SELECT * FROM shipments WHERE order_id = ?", (result["order_id"],))
         self.assertEqual(shipment["status"], "processing")
+
+        transaction = fetch_one(
+            "SELECT * FROM payment_transactions WHERE payment_id = ?",
+            (payment["id"],),
+        )
+        self.assertEqual(transaction["type"], "charge")
+        self.assertEqual(transaction["amount_minor"], result["total_minor"])
+        self.assertEqual(transaction["idempotency_key"], f"charge_{result['order_id']}")
+
+    def test_failed_charge_leaves_order_and_payment_pending(self):
+        previous_mode = payment_service.get_mode()
+        payment_service.set_mode("failure")
+        try:
+            result = place_order(
+                self.customer_id,
+                [{"product_id": self.product_id, "quantity": 1}],
+                "Card",
+            )
+        finally:
+            payment_service.set_mode(previous_mode)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["payment_status"], "pending")
+        self.created_order_ids.append(result["order_id"])
+        order = fetch_one("SELECT status FROM orders WHERE id = ?", (result["order_id"],))
+        payment = fetch_one(
+            "SELECT id, status FROM payments WHERE order_id = ?",
+            (result["order_id"],),
+        )
+        self.assertEqual(order["status"], "pending")
+        self.assertEqual(payment["status"], "pending")
+        self.assertIsNone(
+            fetch_one(
+                "SELECT id FROM payment_transactions WHERE payment_id = ?",
+                (payment["id"],),
+            )
+        )
 
     def test_nonexistent_product_fails(self):
         result = place_order(self.customer_id, [{"product_id": "prod_does_not_exist", "quantity": 1}])

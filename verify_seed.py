@@ -96,6 +96,51 @@ def main() -> None:
     """).fetchone()[0]
     print(f"  Returns on undelivered orders:     {returns_on_undelivered} (expect 0)")
 
+    print("\n=== New table row counts ===")
+    for table in (
+        "users", "addresses", "exchanges", "exchange_items",
+        "return_items", "payment_transactions", "refunds",
+    ):
+        count = cur.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        print(f"  {table:<24} {count}")
+
+    users_without_address = cur.execute("""
+        SELECT COUNT(*) FROM users u
+        WHERE u.role = 'customer'
+          AND NOT EXISTS (
+              SELECT 1 FROM addresses a WHERE a.user_id = u.id
+          )
+    """).fetchone()[0]
+    print(f"  Customers with no address:           {users_without_address} (expect 0)")
+
+    orders_without_user = cur.execute("""
+        SELECT COUNT(*) FROM orders o
+        WHERE NOT EXISTS (
+            SELECT 1 FROM users u WHERE u.customer_id = o.customer_id
+        )
+    """).fetchone()[0]
+    print(f"  Orders with unknown customer:         {orders_without_user} (expect 0)")
+
+    duplicate_customer_ids = cur.execute("""
+        SELECT COUNT(*) - COUNT(DISTINCT customer_id) FROM users
+    """).fetchone()[0]
+    print(f"  Duplicate user customer IDs:          {duplicate_customer_ids} (expect 0)")
+
+    reviewer_count = cur.execute(
+        "SELECT COUNT(*) FROM users WHERE role = 'reviewer'"
+    ).fetchone()[0]
+    print(f"  Reviewer users:                       {reviewer_count} (expect 2)")
+
+    sample_user = cur.execute("""
+        SELECT u.name, u.customer_id, u.role, a.city
+        FROM users u
+        JOIN addresses a ON a.user_id = u.id
+        ORDER BY u.customer_id
+        LIMIT 1
+    """).fetchone()
+    print("\n=== Sample user ===")
+    print(f"  {dict(sample_user) if sample_user else '(empty)'}")
+
     conn.close()
     print("\nDone.")
 

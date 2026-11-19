@@ -9,13 +9,18 @@ import hashlib
 import json
 import re
 import secrets
-from datetime import datetime, timezone, timedelta
-
+import sqlite3
 import uuid
-from datetime import datetime, timezone
-from app.db.database import get_connection, fetch_one, fetch_all
+from datetime import datetime, timedelta, timezone
 
-from app.db.database import fetch_one, fetch_all, execute
+from mock_services import payment_service as mock_payment_service
+from app.db.database import (
+    execute,
+    execute_many,
+    fetch_all,
+    fetch_one,
+    get_connection,
+)
 from app.guardrails.tool_authorizer import check_authorization
 from app.services.audit import log_event
 
@@ -24,6 +29,9 @@ CATALOG_STOP_WORDS = frozenset({
     "want", "need", "like", "have", "some", "that", "this", "with", "from",
     "give", "show", "find", "look", "just", "also", "about", "order", "orders",
     "please", "would", "could", "under", "below", "price",
+})
+STOP_WORDS = frozenset({
+    "a", "the", "i", "want", "to", "buy", "for", "me", "please", "some", "an",
 })
 
 
@@ -53,27 +61,23 @@ def search_catalog(
     if category:
         sql += " AND category = ?"
         params.append(category)
-    query_terms = list(dict.fromkeys(re.findall(r"[a-zA-Z0-9]+", query.lower()))) if query else []
-    if query_terms:
-        term_matches = ["(LOWER(name) LIKE ? OR LOWER(category) LIKE ?)" for _ in query_terms]
-        sql += " AND (" + " OR ".join(term_matches) + ")"
-        params.extend(
-            value
-            for term in query_terms
-            for value in (f"%{term}%", f"%{term}%")
+    keywords = list(dict.fromkeys(
+        word for word in (query or "").lower().split()
+        if word not in STOP_WORDS and len(word) > 2
+    ))
+    if keywords:
+        name_matches = ["LOWER(name) LIKE ?" for _ in keywords]
+        sql += " AND (" + " OR ".join(name_matches) + ")"
+        keyword_patterns = [f"%{word}%" for word in keywords]
+        params.extend(keyword_patterns)
+        match_score = " + ".join(
+            "CASE WHEN LOWER(name) LIKE ? THEN 1 ELSE 0 END"
+            for _ in keywords
         )
-        relevance = " + ".join(
-            "CASE WHEN LOWER(name) LIKE ? OR LOWER(category) LIKE ? THEN 1 ELSE 0 END"
-            for _ in query_terms
-        )
-        sql += f" ORDER BY ({relevance}) DESC, id LIMIT 10"
-        params.extend(
-            value
-            for term in query_terms
-            for value in (f"%{term}%", f"%{term}%")
-        )
+        sql += f" ORDER BY ({match_score}) DESC, price_minor ASC LIMIT 10"
+        params.extend(keyword_patterns)
     else:
-        sql += " ORDER BY id LIMIT 10"
+        sql += " ORDER BY price_minor ASC LIMIT 10"
 
     rows = fetch_all(sql, tuple(params)) if params else fetch_all(sql, ())
 
@@ -257,6 +261,39 @@ def execute_approved_exchange(proposal_id: str, customer_id: str) -> dict:
         (new_payment_id, new_order_id, replacement_price_minor, now),
     )
 
+    exchange_id = f"exc_{uuid.uuid4().hex[:8]}"
+    original_items = fetch_all(
+        "SELECT id FROM order_items WHERE order_id = ?",
+        (original_order_id,),
+    )
+    exchange_statements = [
+        (
+            """
+            INSERT INTO exchanges
+                (id, original_order_id, replacement_order_id, customer_id, status, created_at)
+            VALUES (?, ?, ?, ?, 'completed', ?)
+            """,
+            (exchange_id, original_order_id, new_order_id, customer_id, now),
+        ),
+    ]
+    exchange_statements.extend(
+        (
+            """
+            INSERT INTO exchange_items
+                (id, exchange_id, original_order_item_id, replacement_product_id, quantity)
+            VALUES (?, ?, ?, ?, 1)
+            """,
+            (
+                f"exi_{uuid.uuid4().hex[:8]}",
+                exchange_id,
+                item["id"],
+                product["id"],
+            ),
+        )
+        for item in original_items
+    )
+    execute_many(exchange_statements)
+
     log_event(
         run_id,
         customer_id,
@@ -279,20 +316,16 @@ def execute_approved_exchange(proposal_id: str, customer_id: str) -> dict:
         "status": "exchange_created",
     }
 
-def place_order(customer_id: str, items: list[dict]) -> dict:
+def place_order(
+    customer_id: str,
+    items: list[dict],
+    payment_method: str = "mock_card",
+) -> dict:
     """
-    Creates a new order for the authenticated customer.
+    Create an order from catalog-priced items and attempt payment.
 
-    items: list of {"product_id": str, "quantity": int}
-
-    Writes atomically to orders, order_items, payments, shipments.
-    Prices are always re-read from product_catalog — never trusted
-    from the caller or from LLM output.
-
-    Returns:
-        {"success": True, "order_id": ..., "total_minor": ..., "items": [...]}
-        or
-        {"success": False, "error_code": ..., "message": ...}
+    Order rows are committed before charging so a failed payment leaves a
+    pending order that can be retried.
     """
     if not items:
         return {
@@ -302,108 +335,169 @@ def place_order(customer_id: str, items: list[dict]) -> dict:
         }
 
     order_id = f"ord_{uuid.uuid4().hex[:8]}"
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    resolved_items = []
+    payment_id = f"pay_{uuid.uuid4().hex[:8]}"
+    shipment_id = f"shp_{uuid.uuid4().hex[:8]}"
+    now = _utcnow()
+    resolved_items: list[dict] = []
     total_minor = 0
 
     try:
         with get_connection() as conn:
-            cur = conn.cursor()
-
-            # Resolve and validate each item against the live catalog
             for item in items:
-                product_id = item.get("product_id")
-                quantity = item.get("quantity", 1)
-
-                if not product_id or quantity < 1:
+                if not isinstance(item, dict):
                     return {
                         "success": False,
                         "error_code": "INVALID_ITEM",
                         "message": f"Invalid item payload: {item}",
                     }
 
-                product = fetch_one(
+                product_id = item.get("product_id")
+                quantity = item.get("quantity", 1)
+                if (
+                    not isinstance(product_id, str)
+                    or not product_id
+                    or not isinstance(quantity, int)
+                    or isinstance(quantity, bool)
+                    or quantity < 1
+                ):
+                    return {
+                        "success": False,
+                        "error_code": "INVALID_ITEM",
+                        "message": f"Invalid item payload: {item}",
+                    }
+
+                product = conn.execute(
                     "SELECT id, name, category, price_minor, in_stock "
                     "FROM product_catalog WHERE id = ?",
                     (product_id,),
-                )
+                ).fetchone()
 
                 if product is None:
                     return {
                         "success": False,
                         "error_code": "PRODUCT_NOT_FOUND",
-                        "message": f"Product {product_id} does not exist.",
+                        "message": f"Product {product_id} not found",
                     }
 
                 if not product["in_stock"]:
                     return {
                         "success": False,
                         "error_code": "OUT_OF_STOCK",
-                        "message": f"Product {product['name']} is out of stock.",
+                        "message": f"{product['name']} is out of stock",
                     }
 
-                line_total = product["price_minor"] * quantity
-                total_minor += line_total
-
                 resolved_items.append({
-                    "order_item_id": f"oi_{uuid.uuid4().hex[:8]}",
+                    "id": f"oi_{uuid.uuid4().hex[:8]}",
                     "product_id": product["id"],
                     "product_name": product["name"],
                     "category": product["category"],
                     "quantity": quantity,
                     "price_minor": product["price_minor"],
                 })
+                total_minor += product["price_minor"] * quantity
 
-            # Insert order
-            cur.execute(
+            conn.execute(
                 "INSERT INTO orders (id, customer_id, status, currency, "
-                "total_minor, created_at, delivered_at) "
-                "VALUES (?, ?, 'confirmed', 'INR', ?, ?, NULL)",
+                "total_minor, created_at, delivered_at, shipping_address_id) "
+                "VALUES (?, ?, 'pending', 'INR', ?, ?, NULL, NULL)",
                 (order_id, customer_id, total_minor, now),
             )
 
-            # Insert order_items
-            for ri in resolved_items:
-                cur.execute(
+            for item in resolved_items:
+                conn.execute(
                     "INSERT INTO order_items (id, order_id, product_id, "
                     "product_name, category, quantity, price_minor) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
-                        ri["order_item_id"], order_id, ri["product_id"],
-                        ri["product_name"], ri["category"],
-                        ri["quantity"], ri["price_minor"],
+                        item["id"],
+                        order_id,
+                        item["product_id"],
+                        item["product_name"],
+                        item["category"],
+                        item["quantity"],
+                        item["price_minor"],
                     ),
                 )
 
-            # Insert payment
-            payment_id = f"pay_{uuid.uuid4().hex[:8]}"
-            cur.execute(
+            conn.execute(
                 "INSERT INTO payments (id, order_id, status, amount_minor, "
                 "refunded_minor, payment_method, paid_at) "
-                "VALUES (?, ?, 'paid', ?, 0, 'mock_card', ?)",
-                (payment_id, order_id, total_minor, now),
+                "VALUES (?, ?, 'pending', ?, 0, NULL, NULL)",
+                (payment_id, order_id, total_minor),
             )
 
-            # Insert shipment
-            shipment_id = f"shp_{uuid.uuid4().hex[:8]}"
-            cur.execute(
+            conn.execute(
                 "INSERT INTO shipments (id, order_id, carrier, tracking_id, "
                 "status, estimated_delivery, last_updated) "
                 "VALUES (?, ?, NULL, NULL, 'processing', NULL, ?)",
                 (shipment_id, order_id, now),
             )
-
-        return {
-            "success": True,
-            "order_id": order_id,
-            "total_minor": total_minor,
-            "items": resolved_items,
-        }
-
-    except Exception as e:
+    except sqlite3.Error as error:
         return {
             "success": False,
             "error_code": "ORDER_CREATION_FAILED",
-            "message": str(e),
+            "message": str(error),
         }
+
+    try:
+        charge_result = mock_payment_service.charge(
+            order_id, total_minor, payment_method
+        )
+    except (TimeoutError, sqlite3.Error):
+        charge_result = {"success": False}
+
+    payment_status = "pending"
+    if charge_result.get("success"):
+        paid_at = _utcnow()
+        provider_reference = (
+            charge_result.get("provider_reference")
+            or charge_result.get("transaction_id")
+        )
+        try:
+            with get_connection() as conn:
+                conn.execute(
+                    "UPDATE payments SET status = 'paid', payment_method = ?, "
+                    "paid_at = ? WHERE order_id = ?",
+                    (payment_method, paid_at, order_id),
+                )
+                conn.execute(
+                    "UPDATE orders SET status = 'confirmed' WHERE id = ?",
+                    (order_id,),
+                )
+                conn.execute(
+                    "INSERT INTO payment_transactions "
+                    "(id, payment_id, type, amount_minor, idempotency_key, "
+                    "provider_reference, status, created_at) "
+                    "VALUES (?, ?, 'charge', ?, ?, ?, 'success', ?)",
+                    (
+                        f"ptx_{uuid.uuid4().hex[:8]}",
+                        payment_id,
+                        total_minor,
+                        f"charge_{order_id}",
+                        provider_reference,
+                        paid_at,
+                    ),
+                )
+        except sqlite3.Error as error:
+            return {
+                "success": False,
+                "error_code": "PAYMENT_FINALIZATION_FAILED",
+                "message": str(error),
+            }
+        payment_status = "paid"
+
+    return {
+        "success": True,
+        "order_id": order_id,
+        "total_minor": total_minor,
+        "items": [
+            {
+                "product_id": item["product_id"],
+                "product_name": item["product_name"],
+                "quantity": item["quantity"],
+                "price_minor": item["price_minor"],
+            }
+            for item in resolved_items
+        ],
+        "payment_status": payment_status,
+    }

@@ -138,6 +138,27 @@ def submit_message(run_id: str, body: CustomerMessage, customer_id: str = Depend
                   payload=str(e))
         raise HTTPException(status_code=500, detail="Workflow failed to resume.")
 
+    if "__interrupt__" in result:
+        interrupt_value = result["__interrupt__"][0].value
+        clarification = (
+            interrupt_value.get("message", "")
+            if isinstance(interrupt_value, dict)
+            else str(interrupt_value)
+        )
+        execute(
+            "UPDATE workflow_runs SET status = 'paused', completed_at = NULL WHERE id = ?",
+            (run_id,),
+        )
+        execute(
+            "UPDATE tickets SET summary = ? WHERE id = ?",
+            (clarification, run["ticket_id"]),
+        )
+        return {
+            "run_id": run_id,
+            "status": "paused",
+            "final_response": clarification,
+        }
+
     final_status = "failed" if result.get("error_code") else "completed"
     execute(
         "UPDATE workflow_runs SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",

@@ -123,6 +123,11 @@ def get_return_status(order_id: str) -> dict:
             "retryable": False,
             "message": "No return record found for this order."
         }
+    items = fetch_all(
+        "SELECT id, return_id, order_item_id, quantity, reason, condition "
+        "FROM return_items WHERE return_id = ? ORDER BY id",
+        (row["id"],),
+    )
     return {
         "success": True,
         "return_id": row["id"],
@@ -130,5 +135,6 @@ def get_return_status(order_id: str) -> dict:
         "status": row["status"],
         "reason": row["reason"],
         "received_at": row["received_at"],
-        "inspection_status": row["inspection_status"]
+        "inspection_status": row["inspection_status"],
+        "items": [dict(item) for item in items],
     }

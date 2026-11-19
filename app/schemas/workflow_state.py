@@ -53,7 +53,7 @@ class OrderConfirmationOutput(BaseModel):
     """
     selected_product_id: Optional[str] = None
     quantity: int = 1
-    confirmation_message: str
+    clarification_message: str
     needs_clarification: bool = False
 
     @field_validator("quantity")

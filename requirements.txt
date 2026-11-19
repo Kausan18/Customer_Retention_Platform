@@ -5,3 +5,4 @@ langgraph==1.2.14
 langgraph-checkpoint==4.2.0
 uvicorn==0.41.0
 sentence-transformers==6.2.0
+streamlit==1.67.0

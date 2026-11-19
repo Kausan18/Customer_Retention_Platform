@@ -111,10 +111,11 @@ def _apply_failure_mode() -> Optional[Dict[str, Any]]:
 # Public operations
 # --------------------------------------------------------------------------
 
-def charge(order_id: str, amount_minor: int, payment_method: str) -> Dict[str, Any]:
-    """Mark an order as paid. Used during order placement.
+def charge(order_id: str | None, amount_minor: int, payment_method: str) -> Dict[str, Any]:
+    """Charge an order, or authorize a charge before an order is created.
 
-    Returns {"success": True, "transaction_id": ...} or a structured failure.
+    With no order_id, this performs an authorization only; the order workflow
+    creates the payment row after the order itself exists.
     """
     if amount_minor <= 0:
         return {
@@ -129,6 +130,14 @@ def charge(order_id: str, amount_minor: int, payment_method: str) -> Dict[str, A
         return failure
 
     transaction_id = _new_reference("txn")
+    if order_id is None:
+        return {
+            "success": True,
+            "transaction_id": transaction_id,
+            "status": "authorized",
+            "method": "Mock Card •••• 4242",
+        }
+
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
 
     existing = _get_payment_row(order_id)

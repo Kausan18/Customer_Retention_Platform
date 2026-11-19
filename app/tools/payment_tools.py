@@ -11,8 +11,9 @@ import hashlib
 import json
 import secrets
 from datetime import datetime, timezone, timedelta
+from uuid import uuid4
 
-from app.db.database import fetch_one, execute
+from app.db.database import fetch_one, execute, execute_many
 from app.guardrails.tool_authorizer import check_authorization
 from app.services.audit import log_event
 from mock_services.payment_service import refund as payment_refund
@@ -124,6 +125,66 @@ def execute_approved_refund(proposal_id: str, customer_id: str) -> dict:
     idempotency_key = f"refund_{proposal_id}"
 
     result = payment_refund(order_id, amount_minor, idempotency_key)
+    payment = fetch_one(
+        "SELECT id FROM payments WHERE order_id = ?",
+        (order_id,),
+    )
+    if payment is not None:
+        now = _utcnow()
+        status = "success" if result.get("success") else "failed"
+        provider_reference = result.get("provider_reference")
+        execute_many([
+            (
+                """
+                INSERT INTO refunds
+                    (id, payment_id, order_id, proposal_id, amount_minor,
+                     idempotency_key, provider_ref, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(idempotency_key) DO UPDATE SET
+                    payment_id = excluded.payment_id,
+                    order_id = excluded.order_id,
+                    proposal_id = excluded.proposal_id,
+                    amount_minor = excluded.amount_minor,
+                    provider_ref = excluded.provider_ref,
+                    status = excluded.status,
+                    created_at = excluded.created_at
+                """,
+                (
+                    f"ref_{uuid4().hex[:8]}",
+                    payment["id"],
+                    order_id,
+                    proposal_id,
+                    amount_minor,
+                    idempotency_key,
+                    provider_reference,
+                    status,
+                    now,
+                ),
+            ),
+            (
+                """
+                INSERT INTO payment_transactions
+                    (id, payment_id, type, amount_minor, idempotency_key,
+                     provider_reference, status, created_at)
+                VALUES (?, ?, 'refund', ?, ?, ?, ?, ?)
+                ON CONFLICT(idempotency_key) DO UPDATE SET
+                    payment_id = excluded.payment_id,
+                    amount_minor = excluded.amount_minor,
+                    provider_reference = excluded.provider_reference,
+                    status = excluded.status,
+                    created_at = excluded.created_at
+                """,
+                (
+                    f"ptx_{uuid4().hex[:8]}",
+                    payment["id"],
+                    amount_minor,
+                    idempotency_key,
+                    provider_reference,
+                    status,
+                    now,
+                ),
+            ),
+        ])
 
     if result.get("success"):
         log_event(

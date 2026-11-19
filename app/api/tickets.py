@@ -4,6 +4,7 @@ POST /tickets       — create a support ticket
 POST /tickets/{id}/runs — start a resolution workflow
 """
 
+import logging
 import uuid
 from datetime import datetime, timezone
 
@@ -26,10 +27,42 @@ from app.agents.exchange_workflow import exchange_workflow_graph
 from app.agents.order_placement import order_placement_graph
 
 router = APIRouter(prefix="/tickets", tags=["tickets"])
+logger = logging.getLogger(__name__)
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+POLICY_QUESTION_KEYWORDS = (
+    "how can i",
+    "how do i",
+    "how to",
+    "what is your",
+    "what are your",
+    "tell me about",
+    "can you explain",
+    "do you offer",
+    "policy",
+    "refund policy",
+    "exchange policy",
+    "return policy",
+    "how long",
+    "how many days",
+    "eligible",
+    "damaged",
+    "shipping delay",
+    "rules",
+    "terms",
+    "process",
+    "procedure",
+    "window",
+)
+
+
+def _is_policy_question(message: str) -> bool:
+    message_lower = message.lower()
+    return any(keyword in message_lower for keyword in POLICY_QUESTION_KEYWORDS)
 
 
 def _build_initial_refund_state(ticket: dict, run_id: str, customer_id: str) -> dict:
@@ -192,11 +225,52 @@ def create_ticket(
 def run_workflow(ticket: dict, run_id: str, customer_id: str) -> dict | None:
     """
     Dispatches to the correct LangGraph workflow based on ticket category.
-    order_tracking and order_status run synchronously via graph.invoke()
-    and complete within the request. Refund and exchange may pause while
-    waiting for reviewer approval.
+    Policy questions and order lookups complete synchronously. Refund and
+    exchange may pause while waiting for reviewer approval.
     """
+    message = ticket.get("summary") or ticket.get("message", "")
     category = ticket["category"]
+    if category != "policy" and _is_policy_question(message):
+        from app.main import answer_policy_question
+
+        final_response = answer_policy_question(message)
+        completed_at = datetime.now(timezone.utc).isoformat()
+        execute(
+            "UPDATE tickets SET summary = ?, status = 'resolved', updated_at = ? WHERE id = ?",
+            (final_response, completed_at, ticket["id"]),
+        )
+        execute(
+            "UPDATE workflow_runs SET status = 'completed', completed_at = ? WHERE id = ?",
+            (completed_at, run_id),
+        )
+        return {
+            "run_status": "completed",
+            "final_response": final_response,
+        }
+
+    if category == "policy":
+        from app.main import answer_policy_question
+
+        response = answer_policy_question(ticket.get("summary") or "")
+        completed_at = _now_iso()
+        execute(
+            "UPDATE tickets SET status='resolved', summary=? WHERE id=?",
+            (response, ticket["id"]),
+        )
+        execute(
+            "UPDATE workflow_runs SET status='completed', completed_at=? WHERE id=?",
+            (completed_at, run_id),
+        )
+        audit.log_event(
+            run_id=run_id,
+            actor=customer_id,
+            event_type="workflow_completed",
+            payload={"category": "policy"},
+        )
+        return {
+            "status": "completed",
+            "final_response": response,
+        }
 
     if category in ("order_tracking", "order_status"):
         initial_state = {
@@ -256,6 +330,7 @@ def run_workflow(ticket: dict, run_id: str, customer_id: str) -> dict | None:
         try:
             result = order_placement_graph.invoke(initial_state, config=config)
         except Exception as e:
+            logger.exception("Order placement graph failed for run %s", run_id)
             execute(
                 "UPDATE workflow_runs SET status = 'failed' WHERE id = ?",
                 (run_id,),
@@ -268,9 +343,12 @@ def run_workflow(ticket: dict, run_id: str, customer_id: str) -> dict | None:
                 run_id=run_id,
                 actor="system",
                 event_type="workflow_error",
-                payload=str(e),
+                payload={"error_type": type(e).__name__},
             )
-            raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(
+                status_code=500,
+                detail="Order placement workflow failed.",
+            ) from e
 
         # The graph pauses at await_confirmation_node via interrupt().
         # LangGraph surfaces this as an __interrupt__ key in the result.
@@ -322,12 +400,17 @@ def start_run(
             detail="Ticket not found or does not belong to this customer.",
         )
 
-    intent_result = validate_intent(ticket["category"], ticket["summary"] or "")
-    if intent_result.action == "BLOCK":
-        raise HTTPException(
-            status_code=400,
-            detail={"blocked": True, "reason": intent_result.reason},
-        )
+    policy_category = ticket["category"] == "policy"
+    policy_question = (
+        not policy_category and _is_policy_question(ticket["summary"] or "")
+    )
+    if not policy_question and not policy_category:
+        intent_result = validate_intent(ticket["category"], ticket["summary"] or "")
+        if intent_result.action == "BLOCK":
+            raise HTTPException(
+                status_code=400,
+                detail={"blocked": True, "reason": intent_result.reason},
+            )
 
     if ticket["status"] not in ("open", "in_progress"):
         raise HTTPException(
@@ -359,7 +442,37 @@ def start_run(
         payload={"ticket_id": ticket_id, "category": ticket["category"]},
     )
 
-    run_workflow(ticket, run_id, customer_id)
+    if policy_question:
+        # Import locally because app.main imports this router during initialization.
+        from app.main import answer_policy_question
+
+        policy_answer = answer_policy_question(ticket["summary"] or "")
+        completed_at = _now_iso()
+        execute(
+            "UPDATE tickets SET summary = ?, status = 'resolved', updated_at = ? WHERE id = ?",
+            (policy_answer, completed_at, ticket["id"]),
+        )
+        execute(
+            "UPDATE workflow_runs SET status = 'completed', completed_at = ? WHERE id = ?",
+            (completed_at, run_id),
+        )
+        audit.log_event(
+            run_id=run_id,
+            actor=ticket["customer_id"],
+            event_type="workflow_completed",
+            payload={"method": "policy_rag"},
+        )
+        return WorkflowRunResponse(
+            run_id=run_id,
+            ticket_id=ticket["id"],
+            thread_id=thread_id,
+            status="completed",
+            started_at=now,
+            completed_at=completed_at,
+            final_response=policy_answer,
+        )
+
+    workflow_result = run_workflow(ticket, run_id, customer_id)
     run_data = fetch_one(
         "SELECT status, completed_at FROM workflow_runs WHERE id = ?",
         (run_id,),
@@ -377,4 +490,9 @@ def start_run(
         status=run_data["status"],
         started_at=now,
         completed_at=run_data["completed_at"],
+        final_response=(
+            workflow_result.get("final_response")
+            if policy_category and workflow_result
+            else None
+        ),
     )

@@ -11,15 +11,19 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from fastapi import FastAPI
+from uuid import uuid4
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from app.api import tickets, runs, approvals
-from app.auth.session import create_session, invalidate_session
-from app.db.database import fetch_one
+from app.auth.session import create_session, invalidate_session, require_session
+from app.db.database import fetch_one, get_connection
+from app.schemas.user import SignupRequest, SignupResponse
+from app.tools.catalog_tools import place_order
 from app.services.gemini_client import GeminiChatClient, call_gemini
 from app.services.rate_limiter import rate_limiter
 from app.tools.policy_tools import search_policy_tool
 import hmac, os
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 from app.guardrails.input_screener import (
@@ -492,6 +496,161 @@ class LoginRequest(BaseModel):
     pin: str
 
 
+class CartItemRequest(BaseModel):
+    product_id: str
+    quantity: int = Field(gt=0, strict=True)
+
+
+class OrderRequest(BaseModel):
+    items: list[CartItemRequest]
+    payment_method: str
+
+
+class CartValidationRequest(BaseModel):
+    items: list[CartItemRequest]
+
+
+@app.post("/auth/signup", response_model=SignupResponse)
+def signup(body: SignupRequest) -> SignupResponse:
+    user_id = f"usr_{uuid4().hex[:8]}"
+    address_id = f"adr_{uuid4().hex[:8]}"
+    now = datetime.now(timezone.utc).isoformat()
+
+    try:
+        with get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT id FROM users WHERE email = ?", (body.email,)
+            ).fetchone()
+            if existing is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="An account with this email already exists",
+                )
+
+            row = conn.execute(
+                "SELECT MAX(customer_id) FROM users WHERE role = 'customer'"
+            ).fetchone()
+            max_customer_id = row[0]
+            next_number = int(max_customer_id[1:]) + 1 if max_customer_id else 1
+            customer_id = f"C{str(next_number).zfill(6)}"
+
+            conn.execute(
+                "INSERT INTO users "
+                "(id, customer_id, name, email, phone, pin, role, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'customer', ?)",
+                (
+                    user_id,
+                    customer_id,
+                    body.name,
+                    body.email,
+                    body.phone,
+                    body.pin,
+                    now,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO addresses "
+                "(id, user_id, label, line1, line2, city, state, pincode, is_default) "
+                "VALUES (?, ?, 'Home', ?, ?, ?, ?, ?, 1)",
+                (
+                    address_id,
+                    user_id,
+                    body.address_line1,
+                    body.address_line2,
+                    body.city,
+                    body.state,
+                    body.pincode,
+                ),
+            )
+    except sqlite3.Error:
+        raise HTTPException(
+            status_code=500,
+            detail="Account creation failed. Please try again.",
+        )
+
+    return SignupResponse(
+        customer_id=customer_id,
+        name=body.name,
+        message=(
+            "Account created successfully. Your customer ID is "
+            f"{customer_id}. Use this to log in."
+        ),
+    )
+
+
+@app.post("/cart/validate")
+def validate_cart(
+    body: list[CartItemRequest] | CartValidationRequest,
+    customer_id: str = Depends(require_session),
+):
+    items = body.items if isinstance(body, CartValidationRequest) else body
+    validated_items = []
+    grand_total_minor = 0
+
+    for item in items:
+        product = fetch_one(
+            "SELECT id, name, category, price_minor, in_stock "
+            "FROM product_catalog WHERE id = ?",
+            (item.product_id,),
+        )
+        if product is None:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "success": False,
+                    "error_code": "PRODUCT_NOT_FOUND",
+                    "product_id": item.product_id,
+                    "message": f"Product {item.product_id} not found",
+                },
+            )
+        if not product["in_stock"]:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "success": False,
+                    "error_code": "OUT_OF_STOCK",
+                    "product_id": item.product_id,
+                    "product_name": product["name"],
+                    "message": f"{product['name']} is out of stock",
+                },
+            )
+
+        line_total_minor = product["price_minor"] * item.quantity
+        grand_total_minor += line_total_minor
+        validated_items.append(
+            {
+                "product_id": product["id"],
+                "product_name": product["name"],
+                "category": product["category"],
+                "quantity": item.quantity,
+                "price_minor": product["price_minor"],
+                "line_total_minor": line_total_minor,
+            }
+        )
+
+    return {
+        "items": validated_items,
+        "grand_total_minor": grand_total_minor,
+    }
+
+
+@app.post("/orders")
+def create_order(
+    body: OrderRequest,
+    customer_id: str = Depends(require_session),
+):
+    result = place_order(
+        customer_id,
+        [item.model_dump() for item in body.items],
+        body.payment_method,
+    )
+    return JSONResponse(
+        status_code=201 if result.get("success") else 400,
+        content=result,
+    )
+
+
 @app.post("/auth/login")
 def login(body: LoginRequest):
     from fastapi import HTTPException, status as http_status
@@ -500,17 +659,46 @@ def login(body: LoginRequest):
     customer_id = unicodedata.normalize("NFKC", body.customer_id.strip()).upper()
     pin = body.pin.strip()
 
-    # Verify customer exists in the seeded support database.
-    row = fetch_one("SELECT customer_id FROM orders WHERE customer_id = ? LIMIT 1", (customer_id,))
+    row = fetch_one(
+        "SELECT id, customer_id, name, role FROM users "
+        "WHERE customer_id = ? AND pin = ?",
+        (customer_id, pin),
+    )
     if row is None:
-        raise HTTPException(status_code=http_status.HTTP_401_UNAUTHORIZED, detail="Customer not found.")
-
-    expected_pin = os.environ.get("DEMO_PIN", "1234")
-    if not hmac.compare_digest(pin, expected_pin):
-        raise HTTPException(status_code=http_status.HTTP_401_UNAUTHORIZED, detail="Invalid PIN.")
+        raise HTTPException(
+            status_code=http_status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid customer ID or PIN",
+        )
+    if row["role"] == "reviewer":
+        raise HTTPException(
+            status_code=http_status.HTTP_403_FORBIDDEN,
+            detail="Use the reviewer login endpoint",
+        )
 
     token = create_session(customer_id)
-    return {"token": token, "customer_id": customer_id}
+    return {"token": token, "customer_id": customer_id, "name": row["name"]}
+
+
+@app.post("/auth/reviewer-login")
+def reviewer_login(body: LoginRequest):
+    from fastapi import HTTPException, status as http_status
+    import unicodedata
+
+    customer_id = unicodedata.normalize("NFKC", body.customer_id.strip()).upper()
+    pin = body.pin.strip()
+    row = fetch_one(
+        "SELECT id, customer_id, name, role FROM users "
+        "WHERE customer_id = ? AND pin = ? AND role = 'reviewer'",
+        (customer_id, pin),
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid reviewer ID or PIN",
+        )
+
+    token = create_session(customer_id, role="reviewer")
+    return {"token": token, "reviewer_id": customer_id, "name": row["name"]}
 
 
 @app.post("/auth/logout")

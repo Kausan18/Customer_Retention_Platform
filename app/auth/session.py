@@ -4,7 +4,7 @@ Session management for V1.
 
 Tokens are stored in process memory — acceptable for V1/demo scope.
 Sessions do not persist across restarts.
-Each token maps to exactly one customer_id.
+Each token maps to one identity and role.
 FastAPI endpoints import require_session as a Depends() dependency.
 """
 
@@ -12,24 +12,27 @@ import secrets
 from datetime import datetime
 from fastapi import Request, HTTPException, status
 
-# token → {"customer_id": str, "created_at": datetime}
+# token → {"customer_id": str, "role": str, "created_at": str}
 _sessions: dict[str, dict] = {}
 
 
-def create_session(customer_id: str) -> str:
-    """Create a new session token for an authenticated customer."""
+def create_session(customer_id: str, role: str = "customer") -> str:
+    """Create a new session token for an authenticated user."""
     token = secrets.token_hex(32)
     _sessions[token] = {
         "customer_id": customer_id,
+        "role": role,
         "created_at": datetime.utcnow().isoformat(),
     }
     return token
 
 
-def get_customer_id(token: str) -> str | None:
-    """Return the customer_id for a valid token, or None."""
+def get_customer_id(token: str) -> dict[str, str] | None:
+    """Return the identity and role for a valid token, or None."""
     entry = _sessions.get(token)
-    return entry["customer_id"] if entry else None
+    if entry is None:
+        return None
+    return {"customer_id": entry["customer_id"], "role": entry["role"]}
 
 
 def invalidate_session(token: str) -> None:
@@ -49,13 +52,36 @@ def require_session(request: Request) -> str:
             detail="Missing or malformed Authorization header.",
         )
     token = auth_header[len("Bearer "):]
-    customer_id = get_customer_id(token)
-    if customer_id is None:
+    session = get_customer_id(token)
+    if session is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired session token.",
         )
-    return customer_id
+    return session["customer_id"]
+
+
+def require_reviewer_session(request: Request) -> str:
+    """FastAPI dependency that requires a valid reviewer session."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or malformed Authorization header.",
+        )
+    token = auth_header[len("Bearer "):]
+    session = get_customer_id(token)
+    if session is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired session token.",
+        )
+    if session["role"] != "reviewer":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Reviewer access required.",
+        )
+    return session["customer_id"]
 
 
 def _clear_all_sessions_for_testing() -> None:

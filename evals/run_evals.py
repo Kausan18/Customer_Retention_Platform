@@ -29,6 +29,7 @@ sys.path.insert(0, str(PROJECT_ROOT))  # so we can import app.services.eligibili
 BASE_URL = "http://127.0.0.1:8000"
 DEMO_PIN = "1234"
 REVIEWER_PIN = "9999"
+REVIEWER_ID = "R000001"
 DB_PATH = PROJECT_ROOT / "data" / "customer_support.sqlite3"
 CASES_PATH = Path(__file__).resolve().parent / "eval_cases.json"
 REPORT_PATH = Path(__file__).resolve().parent / "reports" / "v1_results.json"
@@ -255,16 +256,30 @@ def get_run(token, run_id):
     return r
 
 
+def reviewer_token():
+    r = requests.post(
+        f"{BASE_URL}/auth/reviewer-login",
+        json={"customer_id": REVIEWER_ID, "pin": REVIEWER_PIN},
+    )
+    r.raise_for_status()
+    return r.json()["token"]
+
+
 def get_approvals():
-    r = requests.get(f"{BASE_URL}/approvals", headers={"X-Reviewer-Pin": REVIEWER_PIN})
+    token = reviewer_token()
+    r = requests.get(
+        f"{BASE_URL}/approvals",
+        headers={"Authorization": f"Bearer {token}"},
+    )
     return r
 
 
 def decide_approval(approval_id, decision):
+    token = reviewer_token()
     r = requests.post(
         f"{BASE_URL}/approvals/{approval_id}/decision",
-        json={"decision": decision, "reviewer_id": "eval_harness"},
-        headers={"X-Reviewer-Pin": REVIEWER_PIN},
+        json={"decision": decision},
+        headers={"Authorization": f"Bearer {token}"},
     )
     return r
 

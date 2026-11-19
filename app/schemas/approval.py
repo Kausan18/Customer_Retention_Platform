@@ -1,19 +1,10 @@
 # app/schemas/approval.py
 from typing import Literal
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel
 
 
 class ApprovalDecision(BaseModel):
     decision: Literal["approved", "rejected"]
-    reviewer_id: str
-
-    @field_validator("reviewer_id")
-    @classmethod
-    def reviewer_id_not_empty(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("reviewer_id must not be empty")
-        return v
 
 
 class ApprovalResponse(BaseModel):

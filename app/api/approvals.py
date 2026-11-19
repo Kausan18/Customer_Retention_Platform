@@ -9,8 +9,9 @@ import json
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Header, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 
+from app.auth.session import require_reviewer_session
 from app.db.database import execute, fetch_one, fetch_all
 from app.schemas.approval import ApprovalDecision, ApprovalResponse
 from app.services import audit
@@ -20,27 +21,6 @@ from app.agents.refund_workflow import refund_workflow_graph
 from app.agents.exchange_workflow import exchange_workflow_graph
 
 router = APIRouter(prefix="/approvals", tags=["approvals"])
-
-# ---------------------------------------------------------------------------
-# Reviewer authentication helper
-# ---------------------------------------------------------------------------
-
-def _require_reviewer(x_reviewer_pin: str = Header(..., alias="X-Reviewer-Pin")) -> str:
-    """
-    Simple reviewer auth via X-Reviewer-Pin header.
-    In V1, the PIN is stored in the environment and shared among reviewers.
-    Returns the pin value for use as reviewer identity in audit logs.
-    """
-    import os
-    expected = os.environ.get("REVIEWER_PIN", "9999")
-    # constant-time compare
-    import hmac
-    if not hmac.compare_digest(x_reviewer_pin.strip(), expected):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid reviewer PIN.",
-        )
-    return x_reviewer_pin.strip()
 
 
 def _now_iso() -> str:
@@ -105,23 +85,12 @@ def _resume_workflow(approval_id: str, decision: str) -> None:
 # GET /approvals
 # ---------------------------------------------------------------------------
 
-@router.get("")
-def list_pending_approvals(
-    _reviewer: str = Header(None, alias="X-Reviewer-Pin"),
-) -> list[dict]:
+@router.get("", dependencies=[Depends(require_reviewer_session)])
+def list_pending_approvals() -> list[dict]:
     """
     Return all non-expired pending proposals with ticket + customer context.
     The reviewer sees everything they need to make a decision.
     """
-    # Validate reviewer PIN (reuse helper but allow header directly here)
-    import os, hmac
-    expected = os.environ.get("REVIEWER_PIN", "9999")
-    if not _reviewer or not hmac.compare_digest(_reviewer.strip(), expected):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid reviewer PIN.",
-        )
-
     now = _now_iso()
     rows = fetch_all(
         """
@@ -183,27 +152,16 @@ def list_pending_approvals(
 def submit_decision(
     approval_id: str,
     body: ApprovalDecision,
-    reviewer: str = Header(..., alias="X-Reviewer-Pin"),  # validated below
+    reviewer_id: str = Depends(require_reviewer_session),
 ) -> ApprovalResponse:
     """
     Reviewer approves or rejects a proposal.
 
     Checks (in order):
-      1. Reviewer PIN valid
-      2. Approval record exists and is undecided
-      3. Linked proposal is still pending and not expired
-      4. Payload hash matches (tamper detection)
+      1. Approval record exists and is undecided
+      2. Linked proposal is still pending and not expired
+      3. Payload hash matches (tamper detection)
     """
-    # 1. Reviewer auth
-    import os, hmac
-    expected = os.environ.get("REVIEWER_PIN", "9999")
-    if not hmac.compare_digest(reviewer.strip(), expected):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid reviewer PIN.",
-        )
-
-    # 2. Approval record
     approval = fetch_one(
         "SELECT * FROM approvals WHERE approvals.id = ?",
         (approval_id,),
@@ -219,7 +177,6 @@ def submit_decision(
             detail=f"This approval has already been decided: {approval['decision']}.",
         )
 
-    # 3. Linked proposal
     proposal = fetch_one(
         "SELECT * FROM action_proposals WHERE id = ?",
         (approval["proposal_id"],),
@@ -241,7 +198,6 @@ def submit_decision(
             detail="Proposal has expired. Customer must resubmit.",
         )
 
-    # 4. Hash check
     try:
         current_payload = json.loads(proposal["payload"])
     except (json.JSONDecodeError, TypeError):
@@ -264,7 +220,7 @@ def submit_decision(
         SET reviewer_id = ?, decision = ?, decided_at = ?
         WHERE id = ?
         """,
-        (body.reviewer_id, body.decision, now, approval_id),
+        (reviewer_id, body.decision, now, approval_id),
     )
 
     new_proposal_status = "approved" if body.decision == "approved" else "rejected"
@@ -275,7 +231,7 @@ def submit_decision(
 
     audit.log_event(
         run_id=proposal["run_id"],
-        actor=body.reviewer_id,
+        actor=reviewer_id,
         event_type=f"proposal_{body.decision}",
         payload={
             "proposal_id": proposal["id"],
@@ -300,7 +256,7 @@ def submit_decision(
         approval_id=approval_id,
         proposal_id=proposal["id"],
         decision=body.decision,
-        reviewer_id=body.reviewer_id,
+        reviewer_id=reviewer_id,
         decided_at=now,
         run_status=run_data["status"],
     )

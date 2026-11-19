@@ -4,7 +4,12 @@ from pydantic import BaseModel, field_validator
 
 
 VALID_CATEGORIES = Literal[
-    "order_placement", "order_tracking", "order_status", "refund", "exchange"
+    "order_placement",
+    "order_tracking",
+    "order_status",
+    "refund",
+    "exchange",
+    "policy",
 ]
 
 
