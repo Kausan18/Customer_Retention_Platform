@@ -7,12 +7,13 @@ import os
 import re
 import secrets
 import sqlite3
+from ipaddress import ip_address
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from app.api import tickets, runs, approvals
 from app.auth.session import create_session, invalidate_session, require_session
@@ -489,6 +490,47 @@ app = FastAPI(title="Customer Support Agent", version="1.0.0")
 app.include_router(tickets.router)
 app.include_router(runs.router)
 app.include_router(approvals.router)
+
+
+@app.get("/debug/eligible-refund")
+def debug_eligible_refund(request: Request):
+    client = request.client
+    try:
+        is_loopback = client is not None and ip_address(client.host).is_loopback
+    except ValueError:
+        is_loopback = False
+    if not is_loopback:
+        raise HTTPException(status_code=404, detail="Not found.")
+
+    order = fetch_one(
+        """
+        SELECT
+            o.id AS order_id,
+            o.customer_id,
+            p.amount_minor - p.refunded_minor AS refundable_minor,
+            o.delivered_at,
+            r.status AS return_status,
+            r.inspection_status
+        FROM orders AS o
+        JOIN payments AS p ON p.order_id = o.id
+        JOIN returns AS r ON r.order_id = o.id
+        WHERE o.status = 'delivered'
+          AND datetime(o.delivered_at) >= datetime('now', '-30 days')
+          AND datetime(o.delivered_at) <= datetime('now')
+          AND p.status IN ('paid', 'partially_refunded')
+          AND p.refunded_minor < p.amount_minor
+          AND r.status IN ('received', 'inspecting', 'passed')
+          AND r.inspection_status = 'passed'
+        ORDER BY datetime(o.delivered_at) DESC, o.id
+        LIMIT 1
+        """
+    )
+    if order is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "no eligible order found"},
+        )
+    return order
 
 
 class LoginRequest(BaseModel):

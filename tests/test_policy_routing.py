@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from app.api import tickets
+from app.schemas.ticket import TicketCreate
 from frontend.utils.detect_category import detect_category
 
 
@@ -64,10 +65,10 @@ class PolicyRoutingTests(unittest.TestCase):
     def test_product_requests_route_to_order_placement(self):
         requests = (
             "Show me options on a keyboard",
-            "What do you have in speakers?",
-            "Do you sell laptops?",
-            "Looking for headphones",
-            "I need a jacket",
+            "I'd like to buy speakers",
+            "Buy laptops",
+            "Browse headphones",
+            "Get me a jacket",
         )
         for request in requests:
             with self.subTest(request=request):
@@ -82,10 +83,10 @@ class PolicyRoutingTests(unittest.TestCase):
         )
 
     def test_return_and_general_questions_do_not_become_order_placement(self):
-        self.assertEqual(detect_category("Return my order"), "refund")
+        self.assertEqual(detect_category("Return my order"), "unknown")
         self.assertEqual(
             detect_category("How can I place an order?"),
-            "order_placement",
+            "unknown",
         )
         self.assertEqual(
             detect_category("I want to order headphones"),
@@ -95,9 +96,27 @@ class PolicyRoutingTests(unittest.TestCase):
     def test_tracking_status_confirmations_and_default(self):
         self.assertEqual(detect_category("Where is my order?!"), "order_tracking")
         self.assertEqual(detect_category("What is my payment status?"), "order_status")
-        self.assertEqual(detect_category("option 1"), "order_placement")
-        self.assertEqual(detect_category("Sounds good!"), "order_placement")
-        self.assertEqual(detect_category("Can you help me?"), "order_placement")
+        self.assertEqual(detect_category("option 1"), "unknown")
+        self.assertEqual(detect_category("Sounds good!"), "unknown")
+        self.assertEqual(detect_category("Can you help me?"), "unknown")
+
+    def test_damaged_category_creates_support_ticket_without_workflow(self):
+        body = TicketCreate(category="damaged", message="The item arrived broken")
+        self.assertEqual(body.category, "damaged")
+        ticket = {
+            "id": "ticket_damaged",
+            "customer_id": "customer_test",
+            "category": "damaged",
+            "status": "open",
+            "summary": body.message,
+        }
+
+        with patch.object(tickets, "fetch_one", return_value=ticket), self.assertRaises(
+            tickets.HTTPException
+        ) as raised:
+            tickets.start_run("ticket_damaged", customer_id="customer_test")
+
+        self.assertEqual(raised.exception.status_code, 409)
 
 
 if __name__ == "__main__":

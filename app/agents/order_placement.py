@@ -1,13 +1,10 @@
 import json
-import re
-import uuid
 from typing import TypedDict, Optional
 from langgraph.graph import StateGraph, START, END
-from langgraph.types import interrupt, Command
+from langgraph.types import interrupt
 from langgraph.checkpoint.memory import MemorySaver
 
-from mock_services import payment_service as mock_payment_service
-from app.tools.catalog_tools import extract_catalog_keywords, search_catalog, place_order
+from app.tools.catalog_tools import extract_catalog_keywords, search_catalog
 from app.tools.ticket_tools import update_ticket
 from app.services.audit import log_event
 from app.services.gemini_client import call_gemini
@@ -22,17 +19,11 @@ class PlacementState(TypedDict, total=False):
     catalog_results: Optional[list]
     offered_product_ids: Optional[list]
     customer_selection: Optional[str]
-    selected_product_id: Optional[str]
-    quantity: Optional[int]
+    validated_product: dict
+    cart_item: dict | None = None
     needs_clarification: bool
-    payment_authorised: bool
-    payment_result: dict
-    payment_confirmation: Optional[str]
-    payment_confirmed: bool
-    payment_confirmation_invalid: bool
-    order_result: dict
-    new_order_id: Optional[str]
     final_response: Optional[str]
+    run_status: Optional[str]
     error_code: Optional[str]
     error_message: Optional[str]
 
@@ -150,6 +141,14 @@ def validate_selection_node(state: PlacementState) -> PlacementState:
         for product_id in state["offered_product_ids"]
     ]
 
+    customer_reply = (state.get("customer_reply") or "").strip().lower()
+    offered_ids = state.get("offered_product_ids") or []
+
+    # Bare confirmation — treat as selecting the first offered product
+    bare_confirmations = {"confirm", "yes", "ok", "okay", "sure", "1", "first", "that one", "this one", "go ahead"}
+    if customer_reply in bare_confirmations and offered_ids:
+        return {"selected_product_id": offered_ids[0], "needs_clarification": False}
+
     prompt = f"""
 [SYSTEM]
 You are a customer support agent for TechMart.
@@ -202,220 +201,33 @@ Never guess if the intent is unclear. When in doubt, set needs_clarification to 
 
     return {
         **state,
-        "selected_product_id": parsed.selected_product_id,
-        "quantity": parsed.quantity,
+        "validated_product": {
+            "product_id": parsed.selected_product_id,
+            "product_name": products_by_id[parsed.selected_product_id]["name"],
+            "price_minor": products_by_id[parsed.selected_product_id]["price_minor"],
+            "category": products_by_id[parsed.selected_product_id]["category"],
+            "quantity": parsed.quantity,
+        },
         "needs_clarification": False,
     }
 
 
-def show_payment_summary_node(state: PlacementState) -> PlacementState:
-    selected_product = next(
-        (
-            product
-            for product in state["catalog_results"]
-            if product["product_id"] == state["selected_product_id"]
+def build_cart_response_node(state: PlacementState) -> PlacementState:
+    validated_product = state["validated_product"]
+    cart_item = {
+        **validated_product,
+        "quantity": validated_product.get("quantity", 1),
+    }
+    return {
+        **state,
+        "cart_item": cart_item,
+        "final_response": (
+            f"Got it! I've added {cart_item['product_name']} "
+            f"(₹{cart_item['price_minor'] / 100:.2f}) to your cart. "
+            "You can add more items or type 'checkout' to proceed to payment."
         ),
-        None,
-    )
-    if selected_product is None:
-        return {
-            **state,
-            "error_code": "PRODUCT_NOT_FOUND",
-            "error_message": "The selected product is no longer available.",
-        }
-
-    quantity = state["quantity"]
-    total_minor = selected_product["price_minor"] * quantity
-    retry_message = (
-        "Please reply 'confirm' to place this order or 'cancel' to stop.\n\n"
-        if state.get("payment_confirmation_invalid")
-        else ""
-    )
-    summary = (
-        f"{retry_message}Great choice! Here's your order summary:\n\n"
-        f"- Product: {selected_product['name']} x {quantity}\n"
-        f"- Price: ₹{total_minor / 100:.2f}\n"
-        "- Payment: Mock Card •••• 4242\n\n"
-        "Type 'confirm' to place your order, or 'cancel' to go back."
-    )
-    confirmation = interrupt({"message": summary, "stage": "payment_confirmation"})
-    return {
-        **state,
-        "final_response": summary,
-        "payment_confirmation": confirmation,
-        "payment_confirmation_invalid": False,
+        "run_status": "completed",
     }
-
-
-def validate_payment_confirmation_node(state: PlacementState) -> PlacementState:
-    if state.get("error_code"):
-        return state
-
-    reply = (state.get("payment_confirmation") or "").lower()
-    if re.search(r"\b(cancel|no)\b", reply):
-        return {
-            **state,
-            "payment_confirmed": False,
-            "payment_confirmation_invalid": False,
-            "error_code": "ORDER_CANCELLED",
-            "error_message": "Order cancelled. Let me know if you'd like to try again.",
-        }
-    if re.search(r"\b(confirm|yes|ok(?:ay)?)\b", reply):
-        return {
-            **state,
-            "payment_confirmed": True,
-            "payment_confirmation_invalid": False,
-        }
-    return {
-        **state,
-        "payment_confirmed": False,
-        "payment_confirmation_invalid": True,
-    }
-
-
-def process_payment_node(state: PlacementState) -> PlacementState:
-    if state.get("error_code"):
-        return state
-    if not state.get("payment_confirmed"):
-        return {
-            **state,
-            "payment_authorised": False,
-            "payment_result": {
-                "success": False,
-                "error_code": "PAYMENT_NOT_CONFIRMED",
-            },
-            "error_code": "PAYMENT_FAILED",
-            "error_message": "Payment requires customer confirmation.",
-        }
-
-    selected_product = next(
-        (
-            product
-            for product in state["catalog_results"]
-            if product["product_id"] == state["selected_product_id"]
-        ),
-        None,
-    )
-    if selected_product is None:
-        return {
-            **state,
-            "payment_authorised": False,
-            "payment_result": {
-                "success": False,
-                "error_code": "PRODUCT_NOT_FOUND",
-            },
-            "error_code": "PAYMENT_FAILED",
-            "error_message": "The selected product is no longer available.",
-        }
-
-    quantity = state.get("quantity")
-    if not isinstance(quantity, int) or quantity < 1:
-        return {
-            **state,
-            "payment_authorised": False,
-            "payment_result": {
-                "success": False,
-                "error_code": "INVALID_QUANTITY",
-            },
-            "error_code": "PAYMENT_FAILED",
-            "error_message": "The selected quantity is invalid.",
-        }
-
-    amount_minor = selected_product["price_minor"] * quantity
-    payment_result = mock_payment_service.charge(
-        order_id=None,
-        amount_minor=amount_minor,
-        payment_method="mock_card",
-    )
-    if not payment_result.get("success"):
-        return {
-            **state,
-            "payment_authorised": False,
-            "payment_result": payment_result,
-            "error_code": "PAYMENT_FAILED",
-            "error_message": payment_result.get(
-                "message",
-                "The payment could not be authorized.",
-            ),
-        }
-
-    return {
-        **state,
-        "payment_authorised": True,
-        "payment_result": payment_result,
-    }
-
-
-def create_order_node(state: PlacementState) -> PlacementState:
-    if state.get("error_code"):
-        return state
-
-    if not state.get("payment_authorised"):
-        return {
-            **state,
-            "error_code": "PAYMENT_FAILED",
-            "error_message": "Payment must be authorized before creating an order.",
-        }
-
-    result = place_order(
-        customer_id=state["customer_id"],
-        items=[{"product_id": state["selected_product_id"], "quantity": state["quantity"]}],
-    )
-
-    if not result.get("success"):
-        return {
-            **state,
-            "error_code": result.get("error_code", "ORDER_CREATION_FAILED"),
-            "error_message": result.get("message", "Order creation failed."),
-        }
-
-    log_event(
-        run_id=state["run_id"],
-        actor="system",
-        event_type="order_created",
-        payload=json.dumps({"order_id": result["order_id"], "total_minor": result["total_minor"]}),
-    )
-
-    return {
-        **state,
-        "new_order_id": result["order_id"],
-        "order_result": result,
-    }
-
-
-def final_response_node(state: PlacementState) -> PlacementState:
-    if state.get("error_code"):
-        return state
-
-    prompt = f"""
-[SYSTEM]
-You are a customer support agent for TechMart. Confirm the order in a
-short, friendly message. Only use the facts provided below — do not
-invent shipping dates or carrier names.
-
-[CONTEXT]
-Order result:
-{json.dumps(state["order_result"], indent=2)}
-Payment result:
-{json.dumps(state["payment_result"], indent=2)}
-
-[TASK]
-Write a friendly order confirmation message for the customer. You MUST include all of the following on separate lines:
-- Order ID
-- Product name and quantity
-- Total amount paid in INR (convert from paise: divide by 100)
-- Payment method (from payment_result)
-- Order placed date (today's date from tool results)
-- Estimated delivery: 5-7 business days from today
-- A note that they can ask "where is my order?" anytime to track it
-
-Use only facts from the tool results. Do not invent any details.
-
-[OUTPUT FORMAT]
-Plain text only, no JSON.
-"""
-    raw = call_gemini(prompt)
-    return {**state, "final_response": raw.strip()}
 
 
 def update_ticket_node(state: PlacementState) -> PlacementState:
@@ -435,29 +247,6 @@ def update_ticket_node(state: PlacementState) -> PlacementState:
 
 
 def handle_error_node(state: PlacementState) -> PlacementState:
-    if state.get("error_code") == "ORDER_CANCELLED":
-        safe_message = state.get("error_message") or (
-            "Order cancelled. Let me know if you'd like to try again."
-        )
-        update_ticket(
-            ticket_id=state["ticket_id"],
-            status="resolved",
-            note=safe_message,
-            customer_id=state["customer_id"],
-        )
-        log_event(
-            run_id=state["run_id"],
-            actor="system",
-            event_type="workflow_completed",
-            payload=json.dumps({"outcome": "order_cancelled"}),
-        )
-        return {
-            **state,
-            "final_response": safe_message,
-            "error_code": None,
-            "error_message": None,
-        }
-
     if state.get("error_code") == "NO_CATALOG_RESULTS":
         safe_message = (
             "I couldn't find that product in our catalog. You can browse the available "
@@ -485,7 +274,6 @@ def handle_error_node(state: PlacementState) -> PlacementState:
     safe_message = {
         "NO_PRODUCTS_FOUND": "I couldn't find any matching products in our catalog. A team member will follow up.",
         "SELECTION_UNCLEAR": "I couldn't tell which option you meant. Could you reply with the product name or number?",
-        "PAYMENT_FAILED": "I couldn't authorize the payment, so no order was placed. Please try again.",
     }.get(state.get("error_code"), "Something went wrong processing your order. This has been escalated.")
 
     update_ticket(
@@ -515,16 +303,6 @@ def route_after_selection(state: PlacementState) -> str:
     return "continue"
 
 
-def route_after_payment_confirmation(state: PlacementState) -> str:
-    if state.get("error_code"):
-        return "handle_error_node"
-    if state.get("payment_confirmation_invalid"):
-        return "ask_again"
-    if state.get("payment_confirmed"):
-        return "continue"
-    return "handle_error_node"
-
-
 checkpointer = MemorySaver()
 
 graph_builder = StateGraph(PlacementState)
@@ -533,11 +311,7 @@ graph_builder.add_node("search_catalog_node", search_catalog_node)
 graph_builder.add_node("present_options_node", present_options_node)
 graph_builder.add_node("await_confirmation_node", await_confirmation_node)
 graph_builder.add_node("validate_selection_node", validate_selection_node)
-graph_builder.add_node("show_payment_summary_node", show_payment_summary_node)
-graph_builder.add_node("validate_payment_confirmation_node", validate_payment_confirmation_node)
-graph_builder.add_node("process_payment_node", process_payment_node)
-graph_builder.add_node("create_order_node", create_order_node)
-graph_builder.add_node("final_response_node", final_response_node)
+graph_builder.add_node("build_cart_response_node", build_cart_response_node)
 graph_builder.add_node("update_ticket_node", update_ticket_node)
 graph_builder.add_node("handle_error_node", handle_error_node)
 
@@ -550,22 +324,11 @@ graph_builder.add_conditional_edges("present_options_node", route_after,
 graph_builder.add_edge("await_confirmation_node", "validate_selection_node")
 graph_builder.add_conditional_edges("validate_selection_node", route_after_selection,
     {
-        "continue": "show_payment_summary_node",
+        "continue": "build_cart_response_node",
         "handle_error_node": "handle_error_node",
         "ask_again": "await_confirmation_node",
     })
-graph_builder.add_edge("show_payment_summary_node", "validate_payment_confirmation_node")
-graph_builder.add_conditional_edges("validate_payment_confirmation_node", route_after_payment_confirmation,
-    {
-        "continue": "process_payment_node",
-        "ask_again": "show_payment_summary_node",
-        "handle_error_node": "handle_error_node",
-    })
-graph_builder.add_conditional_edges("process_payment_node", route_after,
-    {"continue": "create_order_node", "handle_error_node": "handle_error_node"})
-graph_builder.add_conditional_edges("create_order_node", route_after,
-    {"continue": "final_response_node", "handle_error_node": "handle_error_node"})
-graph_builder.add_edge("final_response_node", "update_ticket_node")
+graph_builder.add_edge("build_cart_response_node", "update_ticket_node")
 graph_builder.add_edge("update_ticket_node", END)
 graph_builder.add_edge("handle_error_node", END)
 

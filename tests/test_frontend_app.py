@@ -21,6 +21,7 @@ def _set_ui(monkeypatch, page=None):
     if page is not None:
         ui.session_state["page"] = page
     monkeypatch.setattr(app, "st", ui)
+    monkeypatch.setattr(app.session, "st", ui)
     return ui
 
 

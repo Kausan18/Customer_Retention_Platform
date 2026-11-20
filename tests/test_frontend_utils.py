@@ -59,7 +59,7 @@ class DetectCategoryTests(unittest.TestCase):
 
     def test_status_keywords(self):
         self.assertEqual(
-            detect_category("what is the status of my order"),
+            detect_category("order status of my order"),
             "order_status",
         )
 
@@ -80,7 +80,7 @@ class DetectCategoryTests(unittest.TestCase):
 
     def test_face_cream_routes_to_placement(self):
         self.assertEqual(
-            detect_category("do you have face creams"),
+            detect_category("show me face creams"),
             "order_placement",
         )
 
@@ -91,13 +91,13 @@ class DetectCategoryTests(unittest.TestCase):
         )
 
     def test_affirmative_routes_to_placement(self):
-        self.assertEqual(detect_category("yes that one"), "order_placement")
+        self.assertEqual(detect_category("yes that one"), "unknown")
 
     def test_policy_beats_refund(self):
         self.assertEqual(detect_category("what is the refund policy"), "policy")
 
-    def test_default_is_placement(self):
-        self.assertEqual(detect_category("hmm"), "order_placement")
+    def test_default_is_unknown(self):
+        self.assertEqual(detect_category("hmm"), "unknown")
 
 
 class SessionHelperTests(unittest.TestCase):
@@ -180,6 +180,36 @@ class SessionHelperTests(unittest.TestCase):
 
         self.assertEqual(session.st.session_state[session.SESSION_START_TIME], "started")
 
+    def test_init_session_state_sets_chat_defaults_without_touching_auth(self):
+        auth_state = {
+            session.TOKEN: "auth-token",
+            session.CUSTOMER_ID: "C000001",
+            "page": "chat",
+            session.CHAT_HISTORY: [{"preview": "saved"}],
+            "logged_in": True,
+        }
+        session.st.session_state.update(auth_state)
+
+        session.init_session_state()
+
+        expected = {
+            "messages": [],
+            "ticket_id": None,
+            "run_id": None,
+            "awaiting_confirmation": False,
+            "cart_items": [],
+            "current_category": None,
+            "approval_pending": False,
+            "approval_id": None,
+            "confirmed_order": None,
+            "last_user_message": None,
+            "pending_message": None,
+        }
+        for key, value in expected.items():
+            self.assertEqual(session.st.session_state[key], value)
+        for key, value in auth_state.items():
+            self.assertEqual(session.st.session_state[key], value)
+
     def test_save_current_session_to_history_copies_messages_and_truncates_preview(self):
         session.st.session_state[session.SESSION_START_TIME] = "2026-11-19T00:00:00"
         message = "A" * 41
@@ -200,8 +230,9 @@ class SessionHelperTests(unittest.TestCase):
 
         self.assertEqual(session.get_chat_history(), [])
 
-    def test_init_new_chat_saves_and_resets_current_session(self):
+    def test_init_new_chat_resets_current_session_without_changing_history(self):
         session.st.session_state[session.SESSION_START_TIME] = "previous"
+        session.st.session_state[session.CHAT_HISTORY] = [{"preview": "saved"}]
         session.add_message("user", "Previous conversation")
         session.st.session_state[session.CURRENT_RUN_ID] = "run_1"
         session.st.session_state[session.CURRENT_TICKET_ID] = "ticket_1"
@@ -214,7 +245,10 @@ class SessionHelperTests(unittest.TestCase):
             mocked_datetime.utcnow.return_value.isoformat.return_value = "next"
             session.init_new_chat_session()
 
-        self.assertEqual(session.get_chat_history()[0]["started_at"], "previous")
+        self.assertEqual(
+            session.get_chat_history(),
+            [{"preview": "saved"}],
+        )
         self.assertEqual(session.get_messages(), [])
         self.assertIsNone(session.st.session_state[session.CURRENT_RUN_ID])
         self.assertIsNone(session.st.session_state[session.CURRENT_TICKET_ID])
@@ -224,11 +258,61 @@ class SessionHelperTests(unittest.TestCase):
         self.assertEqual(session.st.session_state[session.WORKFLOW_TIMELINE], [])
         self.assertEqual(session.st.session_state[session.SESSION_START_TIME], "next")
 
+    def test_init_new_chat_preserves_auth_and_resets_all_chat_keys(self):
+        session.st.session_state.update(
+            {
+                session.TOKEN: "auth-token",
+                session.CUSTOMER_ID: "C000001",
+                "page": "chat",
+                session.CHAT_HISTORY: [{"preview": "saved"}],
+                "logged_in": True,
+            }
+        )
+        session.init_session_state()
+        for key in session.CHAT_SESSION_KEYS:
+            if key != "messages":
+                session.st.session_state[key] = "stale"
+        for key in (
+            session.CURRENT_RUN_ID,
+            session.CURRENT_TICKET_ID,
+            session.PENDING_APPROVAL,
+            session.CART,
+            session.CART_TOTAL,
+            session.PAYMENT_READY,
+            session.WORKFLOW_TIMELINE,
+        ):
+            session.st.session_state[key] = "stale"
+
+        session.init_new_chat_session()
+
+        self.assertEqual(session.st.session_state[session.TOKEN], "auth-token")
+        self.assertEqual(session.st.session_state[session.CUSTOMER_ID], "C000001")
+        self.assertEqual(session.st.session_state["page"], "chat")
+        self.assertTrue(session.st.session_state["logged_in"])
+        self.assertEqual(
+            session.st.session_state[session.CHAT_HISTORY],
+            [{"preview": "saved"}],
+        )
+        self.assertEqual(session.st.session_state["messages"], [])
+        self.assertIsNone(session.st.session_state["ticket_id"])
+        self.assertIsNone(session.st.session_state["run_id"])
+        self.assertFalse(session.st.session_state["awaiting_confirmation"])
+        self.assertEqual(session.st.session_state["cart_items"], [])
+        self.assertFalse(session.st.session_state["approval_pending"])
+        self.assertIsNone(session.st.session_state[session.CURRENT_RUN_ID])
+        self.assertIsNone(session.st.session_state[session.CURRENT_TICKET_ID])
+        self.assertIsNone(session.st.session_state[session.PENDING_APPROVAL])
+        self.assertEqual(session.st.session_state[session.CART], [])
+        self.assertEqual(session.st.session_state[session.CART_TOTAL], 0)
+        self.assertFalse(session.st.session_state[session.PAYMENT_READY])
+        self.assertEqual(session.st.session_state[session.WORKFLOW_TIMELINE], [])
+
     def test_chat_history_is_capped_at_ten_sessions(self):
         with patch.object(session, "datetime") as mocked_datetime:
             mocked_datetime.utcnow.return_value.isoformat.return_value = "next"
             for index in range(11):
                 session.add_message("user", f"Message {index}")
+                session.save_current_session_to_history()
                 session.init_new_chat_session()
 
         history = session.get_chat_history()

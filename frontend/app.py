@@ -13,6 +13,7 @@ def main() -> None:
         layout="wide",
         initial_sidebar_state="collapsed",
     )
+    session.init_session_state()
 
     if "page" not in st.session_state:
         st.session_state["page"] = "login"

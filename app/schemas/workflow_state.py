@@ -11,6 +11,7 @@ class WorkflowRunResponse(BaseModel):
     started_at: str
     completed_at: str | None = None
     final_response: Optional[str] = None
+    cart_item: dict | None = None
 
 
 class WorkflowEvent(BaseModel):
@@ -49,7 +50,7 @@ class CatalogSearchOutput(BaseModel):
 class OrderConfirmationOutput(BaseModel):
     """
     Output schema for validate_selection_node. selected_product_id is
-    cross-checked against offered_product_ids in code before place_order().
+    cross-checked against offered_product_ids before returning a cart item.
     """
     selected_product_id: Optional[str] = None
     quantity: int = 1

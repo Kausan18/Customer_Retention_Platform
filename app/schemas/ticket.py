@@ -9,6 +9,7 @@ VALID_CATEGORIES = Literal[
     "order_status",
     "refund",
     "exchange",
+    "damaged",
     "policy",
 ]
 

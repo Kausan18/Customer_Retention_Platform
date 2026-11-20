@@ -121,10 +121,13 @@ def create_ticket(
     return _response_result(response)
 
 
-def start_run(token: str, ticket_id: str) -> dict:
+def start_run(token: str, ticket_id: str, message: str | None = None) -> dict:
+    request_kwargs = {"headers": _auth_headers(token)}
+    if message is not None:
+        request_kwargs["json"] = {"message": message}
     response = requests.post(
         f"{BASE_URL}/tickets/{ticket_id}/runs",
-        headers=_auth_headers(token),
+        **request_kwargs,
     )
     return _response_result(response)
 

@@ -15,6 +15,46 @@ _CART_ADDITION_KEYWORDS = (
     "and also",
     "confirm for",
 )
+_ORDER_SELECTION_REPLIES = {
+    "yes",
+    "yes please",
+    "yeah",
+    "yep",
+    "yup",
+    "sure",
+    "okay",
+    "ok",
+    "confirm",
+    "confirmed",
+    "that one",
+    "first option",
+    "second option",
+    "third option",
+    "option one",
+    "option two",
+    "option three",
+    "i ll take it",
+    "ill take it",
+    "i will take it",
+    "i ll take that",
+    "ill take that",
+    "i ll take the first option",
+    "ill take the first option",
+    "i ll take the second option",
+    "ill take the second option",
+    "i ll take the third option",
+    "ill take the third option",
+    "sounds good",
+    "go ahead",
+    "do that",
+    "looks good",
+    "that s right",
+    "thats right",
+    "please do",
+    "the first one",
+    "the second one",
+    "the third one",
+}
 _CHECKOUT_KEYWORDS = (
     "checkout",
     "done adding",
@@ -37,7 +77,31 @@ def _matches_any(text: str, keywords: tuple[str, ...]) -> bool:
     )
 
 
+def _is_order_selection_reply(text: str) -> bool:
+    normalized_text = _normalize_text(text)
+    return normalized_text in _ORDER_SELECTION_REPLIES or bool(
+        re.fullmatch(r"(?:option|choice|number)\s+\d+", normalized_text)
+    )
+
+
 def render() -> None:
+    st.markdown("""
+    <style>
+    /* Remove extra top padding that causes outer scroll */
+    .block-container {
+        padding-top: 1rem;
+        padding-bottom: 0;
+    }
+    /* Ensure chat input stays at bottom */
+    .stChatInput {
+        position: sticky;
+        bottom: 0;
+        background: white;
+        z-index: 100;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
     title_column, logout_column = st.columns([4, 1])
     with title_column:
         st.header("TechMart Customer Support")
@@ -58,7 +122,7 @@ def render() -> None:
     with st.sidebar:
         _render_sidebar()
 
-    messages_container = st.container(height=600, border=False)
+    messages_container = st.container()
     with messages_container:
         for message in session.get_messages():
             cb.render_message(message["role"], message["content"])
@@ -75,15 +139,30 @@ def _handle_message(prompt: str) -> None:
         session.set_payment_ready(True)
         session.add_message(
             "assistant",
-            f"Taking you to payment. Your cart total is "
-            f"₹{session.get_cart_total() / 100:.2f}.",
+            f"Taking you to payment. "
+            f"₹{session.get_cart_total() / 100:.2f} total.",
         )
         return
 
-    category = detect.detect_category(prompt)
+    cart_continuation = (
+        bool(st.session_state.get("cart_items")) or bool(session.get_cart())
+    ) and (
+        st.session_state.get("current_category") == "order_placement"
+        and not st.session_state.get(session.AWAITING_CONFIRMATION, False)
+    )
+    if cart_continuation:
+        category = "order_placement"
+        st.session_state["run_id"] = None
+        st.session_state[session.CURRENT_RUN_ID] = None
+        st.session_state[session.AWAITING_CONFIRMATION] = False
+    else:
+        category = detect.detect_category(prompt)
+        st.session_state["current_category"] = category
+
     if st.session_state.get(session.AWAITING_CONFIRMATION, False):
         if (
             _matches_any(prompt, _CART_ADDITION_KEYWORDS)
+            or _is_order_selection_reply(prompt)
             or category == "order_placement"
         ):
             _handle_add_to_cart(prompt)
@@ -92,18 +171,47 @@ def _handle_message(prompt: str) -> None:
         st.session_state[session.AWAITING_CONFIRMATION] = False
         st.session_state[session.CURRENT_RUN_ID] = None
         st.session_state[session.CURRENT_TICKET_ID] = None
+        st.session_state["run_id"] = None
+        st.session_state["ticket_id"] = None
 
-    token = session.get_token()
-    ticket_result = api.create_ticket(token, category, prompt)
-    if not ticket_result.get("success"):
+    if category == "unknown":
         session.add_message(
             "assistant",
-            f"Sorry, I couldn't process that: {ticket_result.get('error', 'Unknown error')}",
+            "I'm not sure how to categorize that request. Could you clarify whether "
+            "you need help with a refund, exchange, delivery, order status, or finding a product?",
         )
         return
 
-    ticket_id = ticket_result["ticket_id"]
-    run_result = api.start_run(token, ticket_id)
+    token = session.get_token()
+    ticket_id = st.session_state.get(session.CURRENT_TICKET_ID) or st.session_state.get(
+        "ticket_id"
+    )
+    if not (cart_continuation and ticket_id):
+        ticket_result = api.create_ticket(token, category, prompt)
+        if not ticket_result.get("success"):
+            session.add_message(
+                "assistant",
+                f"Sorry, I couldn't process that: {ticket_result.get('error', 'Unknown error')}",
+            )
+            return
+        ticket_id = ticket_result["ticket_id"]
+
+    if category == "damaged":
+        st.session_state[session.CURRENT_RUN_ID] = None
+        st.session_state[session.CURRENT_TICKET_ID] = ticket_id
+        st.session_state["run_id"] = None
+        st.session_state["ticket_id"] = ticket_id
+        session.add_message(
+            "assistant",
+            f"I've created support ticket {ticket_id} for your damaged-item report. "
+            "Our support team will review it.",
+        )
+        return
+
+    if cart_continuation:
+        run_result = api.start_run(token, ticket_id, prompt)
+    else:
+        run_result = api.start_run(token, ticket_id)
     if not run_result.get("success"):
         session.add_message(
             "assistant",
@@ -114,6 +222,8 @@ def _handle_message(prompt: str) -> None:
     run_id = run_result["run_id"]
     st.session_state[session.CURRENT_RUN_ID] = run_id
     st.session_state[session.CURRENT_TICKET_ID] = ticket_id
+    st.session_state["run_id"] = run_id
+    st.session_state["ticket_id"] = ticket_id
 
     result = api.poll_run(token, run_id)
     if result.get("success") is False:
@@ -124,7 +234,19 @@ def _handle_message(prompt: str) -> None:
         return
 
     status = result.get("status")
-    if status == "completed":
+    if status == "completed" and category == "order_placement":
+        run_detail = api.get_run(session.get_token(), run_id)
+        cart_item = result.get("cart_item") or run_detail.get("cart_item")
+        session.add_message(
+            "assistant",
+            result.get("final_response") or "Your request is complete.",
+        )
+        if isinstance(cart_item, dict):
+            _add_cart_item(cart_item)
+        st.session_state[session.AWAITING_CONFIRMATION] = False
+        st.session_state[session.CURRENT_RUN_ID] = None
+        st.session_state["run_id"] = None
+    elif status == "completed":
         session.add_message(
             "assistant",
             result.get("final_response") or "Your request is complete.",
@@ -151,6 +273,14 @@ def _handle_placement_pause(result: dict) -> None:
         result.get("final_response") or "Please choose one of the listed products.",
     )
     st.session_state[session.AWAITING_CONFIRMATION] = True
+
+
+def _add_cart_item(cart_item: dict) -> None:
+    quantity = cart_item.get("quantity", 1)
+    session.add_to_cart({
+        **cart_item,
+        "line_total_minor": cart_item["price_minor"] * quantity,
+    })
 
 
 def _handle_add_to_cart(prompt: str) -> None:
@@ -181,12 +311,16 @@ def _handle_add_to_cart(prompt: str) -> None:
 
     status = result.get("status")
     if status == "completed":
+        cart_item = result.get("cart_item")
+        if isinstance(cart_item, dict):
+            _add_cart_item(cart_item)
         session.add_message(
             "assistant",
             result["final_response"],
         )
         st.session_state[session.AWAITING_CONFIRMATION] = False
         st.session_state[session.CURRENT_RUN_ID] = None
+        st.session_state["run_id"] = None
     elif status == "paused":
         session.add_message(
             "assistant",
@@ -265,32 +399,30 @@ def _render_sidebar() -> None:
                 st.rerun()
                 return
 
-    pending_approval = st.session_state.get(session.PENDING_APPROVAL)
+        pending_approval = st.session_state.get(session.PENDING_APPROVAL)
     if pending_approval:
         st.warning("⏳ Awaiting reviewer decision")
-        if st.button("Check Status", key="check_approval_status"):
-            token = session.get_token()
-            result = api.poll_run(token, pending_approval["run_id"])
-            if result.get("success") is False:
-                st.error(result.get("error", "Could not check the request status."))
-            elif result.get("status") == "completed":
-                session.add_message(
-                    "assistant",
-                    result.get("final_response") or "Your request has been reviewed.",
-                )
-                session.clear_pending_approval()
-                st.rerun()
-                return
-            elif result.get("status") == "failed":
-                session.add_message(
-                    "assistant",
-                    "I encountered an issue processing the reviewed request.",
-                )
-                session.clear_pending_approval()
-                st.rerun()
-                return
-            else:
-                st.info("Your request is still being reviewed.")
+        # Auto-poll on every render — no button needed
+        token = session.get_token()
+        result = api.poll_run(token, pending_approval["run_id"])
+        if result.get("status") == "completed":
+            session.add_message(
+                "assistant",
+                result.get("final_response") or "Your request has been reviewed and approved.",
+            )
+            session.clear_pending_approval()
+            st.rerun()
+            return
+        elif result.get("status") == "failed":
+            session.add_message(
+                "assistant",
+                "I encountered an issue processing the reviewed request.",
+            )
+            session.clear_pending_approval()
+            st.rerun()
+            return
+        else:
+            st.caption("Still awaiting decision...")
 
     timeline = st.session_state.get(session.WORKFLOW_TIMELINE)
     if timeline:

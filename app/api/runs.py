@@ -33,6 +33,7 @@ def _get_run_with_ownership(run_id: str, customer_id: str) -> dict:
             wr.started_at,
             wr.completed_at,
             t.summary AS final_response,
+            t.category AS ticket_category,
             t.customer_id AS ticket_customer_id
         FROM workflow_runs wr
         JOIN tickets t ON t.id = wr.ticket_id
@@ -59,6 +60,13 @@ def get_run(
     customer_id: str = Depends(require_session),
 ) -> WorkflowRunResponse:
     run = _get_run_with_ownership(run_id, customer_id)
+    cart_item = None
+    if run["ticket_category"] == "order_placement":
+        config = {"configurable": {"thread_id": run["thread_id"]}}
+        snapshot = order_placement_graph.get_state(config)
+        if snapshot and snapshot.values:
+            cart_item = snapshot.values.get("cart_item")
+
     return WorkflowRunResponse(
         run_id=run["id"],
         ticket_id=run["ticket_id"],
@@ -67,6 +75,7 @@ def get_run(
         started_at=run["started_at"],
         completed_at=run["completed_at"],
         final_response=run["final_response"],
+        cart_item=cart_item,
     )
 
 
@@ -129,7 +138,7 @@ def submit_message(run_id: str, body: CustomerMessage, customer_id: str = Depend
     if decision.action == "BLOCK":
         raise HTTPException(status_code=400, detail=f"Message blocked: {decision.reason}")
 
-    config = {"configurable": {"thread_id": run_id}}
+    config = {"configurable": {"thread_id": run["thread_id"]}}
     try:
         result = order_placement_graph.invoke(Command(resume=decision.text), config=config)
     except Exception as e:
@@ -169,4 +178,5 @@ def submit_message(run_id: str, body: CustomerMessage, customer_id: str = Depend
         "run_id": run_id,
         "status": final_status,
         "final_response": result.get("final_response"),
+        "cart_item": result.get("cart_item"),
     }

@@ -22,7 +22,7 @@ Key differences from refund_workflow:
 import json
 import re
 from typing import Optional, Any
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 from langgraph.graph import StateGraph, END, START
 from langgraph.checkpoint.memory import MemorySaver
@@ -56,11 +56,6 @@ def extract_requested_category(message: str) -> str | None:
 
 # ─── LLM output schemas ───────────────────────────────────────────────────────
 
-class ExchangeIneligibleOutput(BaseModel):
-    explanation: str
-    policy_ref: str
-
-
 class ExchangeRejectionOutput(BaseModel):
     explanation: str
 
@@ -85,6 +80,7 @@ class ExchangeState(TypedDict):
     error_code: Optional[str]
     error_message: Optional[str]
     final_response: Optional[str]
+    run_status: NotRequired[str]
 
 
 # ─── Nodes ────────────────────────────────────────────────────────────────────
@@ -140,81 +136,44 @@ def check_eligibility_node(state: ExchangeState) -> dict:
 
 
 def explain_ineligible_node(state: ExchangeState) -> dict:
-    catalog_error_responses = {
+    eligibility_error_code = (
+        state.get("eligibility_result") or {}
+    ).get("error_code")
+    error_code = eligibility_error_code or state.get("error_code")
+    messages = {
+        "NOT_DELIVERED": (
+            "Your order hasn't been delivered yet. Exchanges are only available after delivery."
+        ),
+        "OUTSIDE_WINDOW": "Your order is outside the 15-day exchange window.",
+        "PAYMENT_NOT_PAID": "We don't have a completed payment on record for this order.",
+        "ALREADY_REFUNDED": (
+            "This order has already been refunded and is not eligible for exchange."
+        ),
+        "NO_SAME_CATEGORY_ITEM": (
+            "Exchanges are only available within the same product category."
+        ),
         "ORDER_NOT_FOUND": (
             "I couldn't find an order matching your request. "
             "Could you please provide your order ID so I can look into the exchange for you?"
-        ),
-        "NO_SAME_CATEGORY_ITEM": (
-            "We weren't able to find a replacement item in the same category as your original order. "
-            "Per our exchange policy, exchanges must be for a product in the same category."
         ),
         "NO_CATALOG_RESULTS": (
             "We weren't able to find any available products matching your request. "
             "Please contact support for assistance finding a replacement."
         ),
+        "NO_ORDER_FOUND": (
+            "I couldn't find an order matching your request. "
+            "Could you please provide your order ID so I can look into the exchange for you?"
+        ),
     }
-    catalog_error_response = catalog_error_responses.get(state.get("error_code"))
-    if catalog_error_response:
-        return {
-            "final_response": catalog_error_response,
-            "error_code": None,
-            "error_message": None,
-        }
-
-    eligibility = state.get("eligibility_result", {})
-    passages = state.get("policy_passages", [])
-    policy_text = (
-        "\n".join(f"[{p['document']}:{p['section']}] {p['content'][:300]}" for p in passages)
-        if passages
-        else "No policy passages retrieved."
-    )
-
-    prompt = f"""[SYSTEM]
-You are a customer support agent for TechMart. Respond ONLY with valid JSON.
-Do not invent facts. Use only the provided context.
-
-[CONTEXT]
-Customer ID: {state['customer_id']}
-Order ID: {state.get('order_id')}
-Eligibility Result: {json.dumps(eligibility)}
-Policy Passages:
-{policy_text}
-
-[TASK]
-Explain to the customer why their exchange request cannot be processed.
-Reference the specific policy condition not met. Be empathetic, no workarounds.
-
-[OUTPUT FORMAT]
-{{
-  "explanation": "string — 2-3 sentence customer-facing explanation",
-  "policy_ref": "string — e.g. exchange_policy_v1:eligibility_conditions"
-}}
-"""
-    raw = call_gemini(prompt)
-    result, error = validate_output(raw, ExchangeIneligibleOutput)
-    if error:
-        raw2 = call_gemini(f"{prompt}\n\nValidation failed: {error}\nPlease fix and retry.")
-        result, error2 = validate_output(raw2, ExchangeIneligibleOutput)
-        if error2:
-            return {
-                "final_response": (
-                    "We're unable to process your exchange request at this time. "
-                    "Please review our exchange policy or contact support."
-                ),
-                "error_code": "OUTPUT_VALIDATION_FAILED",
-            }
-    explanation = (result.explanation or "").strip()
-    if not explanation:
-        reason = eligibility.get("reason")
-        if eligibility.get("error_code") == "NO_ORDER_FOUND":
-            reason = "We could not identify an order for your exchange request."
-        reason = reason or "Your order does not meet the exchange eligibility conditions."
-        explanation = (
-            f"{reason} Per our exchange policy, exchanges require a delivered order "
-            "within 15 days of delivery and a fully paid, unrefunded payment."
-        )
-    return {"final_response": explanation}
+    return {
+        "final_response": messages.get(
+            error_code,
+            "This order is not eligible for an exchange under our exchange policy.",
+        ),
+        "run_status": "completed",
+        "error_code": None,
+        "error_message": None,
+    }
 
 
 def search_catalog_node(state: ExchangeState) -> dict:
@@ -413,8 +372,9 @@ def revalidate_node(state: ExchangeState) -> dict:
     re_check = check_exchange_eligibility(state["order_id"])
     if not re_check.get("eligible"):
         return {
-            "error_code": "ELIGIBILITY_CHANGED_AFTER_APPROVAL",
-            "error_message": f"Order no longer exchange-eligible: {re_check.get('error_code')}",
+            "eligibility_result": re_check,
+            "error_code": None,
+            "error_message": None,
             "reviewer_decision": decision,
         }
     return {"reviewer_decision": decision}
@@ -522,18 +482,19 @@ def _route_after_investigate(state: ExchangeState) -> str:
 
 
 def _route_after_eligibility(state: ExchangeState) -> str:
-    if state.get("error_code"):
+    eligibility = state.get("eligibility_result")
+    if not isinstance(eligibility, dict):
         return "handle_error"
-    eligible = (state.get("eligibility_result") or {}).get("eligible", False)
-    return "search_catalog_node" if eligible else "explain_ineligible"
+    eligible = eligibility.get("eligible")
+    if eligible is True:
+        return "search_catalog_node"
+    if eligible is False:
+        return "explain_ineligible"
+    return "handle_error"
 
 
 def _route_after_explain_ineligible(state: ExchangeState) -> str:
-    return (
-        "handle_error"
-        if state.get("error_code") == "OUTPUT_VALIDATION_FAILED"
-        else "update_ticket_node"
-    )
+    return "update_ticket_node"
 
 
 def _route_after_search_catalog(state: ExchangeState) -> str:
@@ -556,6 +517,9 @@ def _route_after_revalidate(state: ExchangeState) -> str:
     error = state.get("error_code")
     if error == "PROPOSAL_REJECTED":
         return "handle_rejection"
+    eligibility = state.get("eligibility_result")
+    if eligibility is not None and not eligibility.get("eligible"):
+        return "explain_ineligible"
     if error:
         return "handle_error"
     return "execute_exchange"
@@ -605,6 +569,7 @@ def _build_exchange_graph() -> StateGraph:
     builder.add_edge("await_approval", "revalidate")
     builder.add_conditional_edges("revalidate", _route_after_revalidate,
         {"execute_exchange": "execute_exchange",
+         "explain_ineligible": "explain_ineligible",
          "handle_rejection": "handle_rejection", "handle_error": "handle_error"})
     builder.add_conditional_edges("execute_exchange", _route_after_execute_exchange,
         {"update_ticket_node": "update_ticket_node", "handle_error": "handle_error"})

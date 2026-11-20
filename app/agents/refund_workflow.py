@@ -15,13 +15,13 @@ Design notes:
 - interrupt() lives in await_approval_node (separate from create_proposal_node)
   so create_proposal's state update (proposal_id) is checkpointed before the
   interrupt fires. On resume, the node restarts; proposal_id is already in state.
-- LLM nodes: explain_ineligible, handle_rejection only.
+- LLM node: handle_rejection only.
   All routing, eligibility, proposal creation, execution are pure code.
 - tool_authorizer is called inside execute_approved_refund, not here.
 """
 import json
 from typing import Optional, Any
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 from langgraph.graph import StateGraph, END, START
 from langgraph.checkpoint.memory import MemorySaver
@@ -40,11 +40,6 @@ from app.services.audit import log_event
 
 
 # ─── LLM output schemas ───────────────────────────────────────────────────────
-
-class IneligibleExplanationOutput(BaseModel):
-    explanation: str
-    policy_ref: str
-
 
 class RejectionResponseOutput(BaseModel):
     explanation: str
@@ -78,6 +73,7 @@ class RefundState(TypedDict):
     error_message: Optional[str]
     # Final customer-facing response
     final_response: Optional[str]
+    run_status: NotRequired[str]
 
 
 # ─── Node implementations ─────────────────────────────────────────────────────
@@ -89,15 +85,32 @@ def investigate_node(state: RefundState) -> dict:
 
     if not order_id:
         recent = get_recent_orders(customer_id, 1)
-        if not recent.get("success") or not recent.get("orders"):
+        if not recent.get("success"):
             return {
-                "error_code": "NO_ORDER_FOUND",
-                "error_message": "No orders found for this customer.",
+                "error_code": recent.get("error_code", "ORDER_LOOKUP_FAILED"),
+                "error_message": recent.get("message", "Failed to look up recent orders."),
             }
-        order_id = recent["orders"][0]["order_id"]
+        if not recent.get("orders"):
+            return {
+                "eligibility_result": {
+                    "eligible": False,
+                    "error_code": "ORDER_NOT_FOUND",
+                    "reason": "No orders found for this customer.",
+                },
+            }
+        order_id = recent["orders"][0]["id"]
 
     order = get_order(order_id, customer_id)
     if not order.get("success"):
+        if order.get("error_code") == "ORDER_NOT_FOUND":
+            return {
+                "order_id": order_id,
+                "eligibility_result": {
+                    "eligible": False,
+                    "error_code": "ORDER_NOT_FOUND",
+                    "reason": order.get("message", ""),
+                },
+            }
         return {"error_code": order["error_code"], "error_message": order.get("message", "")}
 
     payment = get_payment_status(order_id)
@@ -133,58 +146,41 @@ def check_eligibility_node(state: RefundState) -> dict:
 
 
 def explain_ineligible_node(state: RefundState) -> dict:
-    """LLM node: empathetic policy-grounded explanation of why refund is ineligible."""
-    eligibility = state.get("eligibility_result", {})
-    passages = state.get("policy_passages", [])
-    policy_text = (
-        "\n".join(
-            f"[{p['document']}:{p['section']}] {p['content'][:300]}" for p in passages
-        )
-        if passages
-        else "No policy passages retrieved."
-    )
-
-    prompt = f"""[SYSTEM]
-You are a customer support agent for TechMart, an online electronics retailer.
-Respond ONLY with valid JSON matching the schema below. No preamble, no markdown.
-Do not invent facts. Base your response only on the provided context.
-
-[CONTEXT]
-Customer ID: {state['customer_id']}
-Order ID: {state.get('order_id')}
-Eligibility Result: {json.dumps(eligibility)}
-Policy Passages:
-{policy_text}
-
-[TASK]
-Explain to the customer why their refund request cannot be processed.
-Reference the specific policy condition that was not met.
-Be empathetic but clear. Do not suggest workarounds or exceptions not in the policy.
-
-[OUTPUT FORMAT]
-{{
-  "explanation": "string — customer-facing explanation, 2-3 sentences",
-  "policy_ref": "string — document:section that applies, e.g. refund_policy_v1:eligibility_conditions"
-}}
-"""
-    raw = call_gemini(prompt)
-    result, error = validate_output(raw, IneligibleExplanationOutput)
-    if error:
-        raw2 = call_gemini(
-            f"{prompt}\n\nPrevious response failed validation: {error}\nPlease fix and retry."
-        )
-        result, error2 = validate_output(raw2, IneligibleExplanationOutput)
-        if error2:
-            return {
-                "final_response": (
-                    "We're unable to process your refund request at this time. "
-                    "Please review our refund policy or contact support for assistance."
-                ),
-                "error_code": "OUTPUT_VALIDATION_FAILED",
-            }
-
-    return {"final_response": result.explanation}
-
+    """Return a clear, deterministic explanation for an ineligible refund."""
+    error_code = (state.get("eligibility_result") or {}).get("error_code")
+    messages = {
+        "NOT_DELIVERED": (
+            "Your order hasn't been delivered yet. Refunds are only available after delivery."
+        ),
+        "OUTSIDE_WINDOW": (
+            "Your order is outside the 30-day refund window. "
+            "Refunds must be requested within 30 days of delivery."
+        ),
+        "PAYMENT_NOT_PAID": "We don't have a completed payment on record for this order.",
+        "ALREADY_REFUNDED": "This order has already been fully refunded.",
+        "NO_RETURN_FOUND": (
+            "We haven't received a return request for this order yet. "
+            "Please initiate a return first."
+        ),
+        "RETURN_NOT_RECEIVED": (
+            "Your return is still in transit. We'll process the refund once we receive it."
+        ),
+        "INSPECTION_NOT_PASSED": (
+            "Unfortunately your return did not pass inspection. "
+            "Please contact support for next steps."
+        ),
+        "ORDER_NOT_FOUND": "We couldn't find that order on your account.",
+        "NO_ORDER_FOUND": "We couldn't find that order on your account.",
+    }
+    return {
+        "final_response": messages.get(
+            error_code,
+            "This order is not eligible for a refund under our refund policy.",
+        ),
+        "run_status": "completed",
+        "error_code": None,
+        "error_message": None,
+    }
 
 def create_proposal_node(state: RefundState) -> dict:
     """
@@ -258,8 +254,9 @@ def revalidate_node(state: RefundState) -> dict:
     re_check = check_refund_eligibility(state["order_id"])
     if not re_check.get("eligible"):
         return {
-            "error_code": "ELIGIBILITY_CHANGED_AFTER_APPROVAL",
-            "error_message": f"Order no longer eligible: {re_check.get('error_code')}",
+            "eligibility_result": re_check,
+            "error_code": None,
+            "error_message": None,
             "reviewer_decision": decision,
         }
 
@@ -329,6 +326,7 @@ def update_ticket_node(state: RefundState) -> dict:
     """Code node: write final_response to ticket summary and set resolved/escalated status."""
     final_response = state.get("final_response") or "Refund workflow completed."
     error_code = state.get("error_code")
+    execution_result = state.get("execution_result") or {}
 
     if error_code == "PROPOSAL_REJECTED":
         status = "resolved"
@@ -338,10 +336,11 @@ def update_ticket_node(state: RefundState) -> dict:
             state.get("error_message")
             or "An issue occurred processing your request. Our team has been notified."
         )
-    else:
-        exec_result = state.get("execution_result") or {}
-        payment_status = exec_result.get("status", "")
+    elif execution_result.get("success"):
+        payment_status = execution_result.get("status", "")
         status = "resolved" if payment_status not in {"pending", "processing", ""} else "in_progress"
+    else:
+        status = "resolved"
 
     update_ticket(state["ticket_id"], status, final_response, state["customer_id"])
     log_event(
@@ -376,22 +375,25 @@ def handle_error_node(state: RefundState) -> dict:
 # ─── Routing functions ─────────────────────────────────────────────────────────
 
 def _route_after_investigate(state: RefundState) -> str:
+    if (state.get("eligibility_result") or {}).get("eligible") is False:
+        return "explain_ineligible"
     return "handle_error" if state.get("error_code") else "retrieve_policy"
 
 
 def _route_after_eligibility(state: RefundState) -> str:
-    if state.get("error_code"):
+    eligibility = state.get("eligibility_result")
+    if not isinstance(eligibility, dict):
         return "handle_error"
-    eligible = (state.get("eligibility_result") or {}).get("eligible", False)
-    return "create_proposal" if eligible else "explain_ineligible"
+    eligible = eligibility.get("eligible")
+    if eligible is True:
+        return "create_proposal"
+    if eligible is False:
+        return "explain_ineligible"
+    return "handle_error"
 
 
 def _route_after_explain_ineligible(state: RefundState) -> str:
-    return (
-        "handle_error"
-        if state.get("error_code") == "OUTPUT_VALIDATION_FAILED"
-        else "update_ticket_node"
-    )
+    return "update_ticket_node"
 
 
 def _route_after_create_proposal(state: RefundState) -> str:
@@ -402,6 +404,9 @@ def _route_after_revalidate(state: RefundState) -> str:
     error = state.get("error_code")
     if error == "PROPOSAL_REJECTED":
         return "handle_rejection"
+    eligibility = state.get("eligibility_result")
+    if eligibility is not None and not eligibility.get("eligible"):
+        return "explain_ineligible"
     if error:
         return "handle_error"
     return "execute_refund"
@@ -432,7 +437,11 @@ def _build_refund_graph() -> StateGraph:
     builder.add_conditional_edges(
         "investigate",
         _route_after_investigate,
-        {"retrieve_policy": "retrieve_policy", "handle_error": "handle_error"},
+        {
+            "retrieve_policy": "retrieve_policy",
+            "explain_ineligible": "explain_ineligible",
+            "handle_error": "handle_error",
+        },
     )
     builder.add_edge("retrieve_policy", "check_eligibility")
     builder.add_conditional_edges(
@@ -460,6 +469,7 @@ def _build_refund_graph() -> StateGraph:
         _route_after_revalidate,
         {
             "execute_refund": "execute_refund",
+            "explain_ineligible": "explain_ineligible",
             "handle_rejection": "handle_rejection",
             "handle_error": "handle_error",
         },

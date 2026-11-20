@@ -91,6 +91,24 @@ def search_catalog(
         for r in rows
     ]
 
+        # If keyword search returned nothing, try matching query against category name directly
+    if not products and query:
+        query_lower = query.lower()
+        category_rows = fetch_all(
+            "SELECT id, name, category, price_minor FROM product_catalog "
+            "WHERE in_stock = 1 AND LOWER(category) LIKE ? ORDER BY price_minor ASC LIMIT 10",
+            (f"%{query_lower}%",),
+        )
+        products = [
+            {
+                "product_id": r["id"],
+                "name": r["name"],
+                "category": r["category"],
+                "price_minor": r["price_minor"],
+            }
+            for r in category_rows
+        ]
+
     if exclude_product_ids:
         products = [p for p in products if p["product_id"] not in exclude_product_ids]
 
@@ -98,7 +116,6 @@ def search_catalog(
     products = products[:5]
 
     return {"success": True, "products": products, "count": len(products)}
-
 
 def create_exchange_proposal(
     run_id: str,

@@ -22,6 +22,52 @@ WORKFLOW_TIMELINE = "workflow_timeline"
 CHAT_HISTORY = "chat_history"
 SESSION_START_TIME = "session_start_time"
 
+CHAT_SESSION_KEYS = [
+    "messages",
+    "ticket_id",
+    "run_id",
+    "awaiting_confirmation",
+    "cart_items",
+    "current_category",
+    "approval_pending",
+    "approval_id",
+    "confirmed_order",
+    "last_user_message",
+    "pending_message",
+]
+
+_APP_CHAT_SESSION_KEYS = [
+    CURRENT_RUN_ID,
+    CURRENT_TICKET_ID,
+    PENDING_APPROVAL,
+    CART,
+    CART_TOTAL,
+    PAYMENT_READY,
+    WORKFLOW_TIMELINE,
+    SESSION_START_TIME,
+]
+
+_CHAT_SESSION_DEFAULTS = {
+    "messages": [],
+    "ticket_id": None,
+    "run_id": None,
+    "awaiting_confirmation": False,
+    "cart_items": [],
+    "current_category": None,
+    "approval_pending": False,
+    "approval_id": None,
+    "confirmed_order": None,
+    "last_user_message": None,
+    "pending_message": None,
+    CURRENT_RUN_ID: None,
+    CURRENT_TICKET_ID: None,
+    PENDING_APPROVAL: None,
+    CART: [],
+    CART_TOTAL: 0,
+    PAYMENT_READY: False,
+    WORKFLOW_TIMELINE: [],
+}
+
 
 def is_logged_in() -> bool:
     return TOKEN in st.session_state and st.session_state[TOKEN] is not None
@@ -41,6 +87,15 @@ def get_customer_id() -> str | None:
 
 def get_name() -> str | None:
     return st.session_state.get(NAME)
+
+
+def init_session_state() -> None:
+    for key, default in _CHAT_SESSION_DEFAULTS.items():
+        if key not in st.session_state:
+            st.session_state[key] = default.copy() if isinstance(default, list) else default
+
+    if SESSION_START_TIME not in st.session_state:
+        st.session_state[SESSION_START_TIME] = datetime.utcnow().isoformat()
 
 
 def set_user(token: str, customer_id: str, role: str, name: str) -> None:
@@ -85,15 +140,11 @@ def save_current_session_to_history() -> None:
 
 
 def init_new_chat_session() -> None:
-    save_current_session_to_history()
-    st.session_state[MESSAGES] = []
-    st.session_state[CURRENT_RUN_ID] = None
-    st.session_state[CURRENT_TICKET_ID] = None
-    st.session_state[PENDING_APPROVAL] = None
-    st.session_state[AWAITING_CONFIRMATION] = False
-    st.session_state[PAYMENT_READY] = False
-    st.session_state[WORKFLOW_TIMELINE] = []
-    st.session_state[SESSION_START_TIME] = datetime.utcnow().isoformat()
+    for key in (*CHAT_SESSION_KEYS, *_APP_CHAT_SESSION_KEYS):
+        if key in st.session_state:
+            del st.session_state[key]
+    st.session_state["messages"] = []
+    init_session_state()
 
 
 def get_chat_history() -> list:

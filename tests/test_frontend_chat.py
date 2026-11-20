@@ -16,7 +16,11 @@ class FakeChatPageStreamlit(FakeStreamlit):
         self.prompts = iter(prompts)
         self.events = []
         self.container_kwargs = []
+        self.markdown_calls = []
         self.sidebar = nullcontext()
+
+    def markdown(self, body, **kwargs):
+        self.markdown_calls.append((body, kwargs))
 
     def columns(self, spec):
         return [nullcontext() for _ in spec]
@@ -167,14 +171,194 @@ def test_checkout_with_items_marks_payment_ready_without_workflow(monkeypatch):
     ui.session_state[session.CART_TOTAL] = 1250
     create_ticket = Mock()
     monkeypatch.setattr(chat.api, "create_ticket", create_ticket)
+    start_run = Mock()
+    monkeypatch.setattr(chat.api, "start_run", start_run)
+    detect_category = Mock()
+    monkeypatch.setattr(chat.detect, "detect_category", detect_category)
 
     chat._handle_message("That's all, checkout")
 
     assert session.is_payment_ready()
     assert session.get_messages()[-1]["content"] == (
-        "Taking you to payment. Your cart total is ₹12.50."
+        "Taking you to payment. ₹12.50 total."
     )
     create_ticket.assert_not_called()
+    start_run.assert_not_called()
+    detect_category.assert_not_called()
+
+
+def test_unknown_message_requests_clarification_without_ticket(monkeypatch):
+    ui = _set_session(monkeypatch)
+    session.set_user("token", "C000001", "customer", "Ava")
+    create_ticket = Mock()
+    start_run = Mock()
+    monkeypatch.setattr(chat.api, "create_ticket", create_ticket)
+    monkeypatch.setattr(chat.api, "start_run", start_run)
+
+    chat._handle_message("Can you help me?")
+
+    create_ticket.assert_not_called()
+    start_run.assert_not_called()
+    assert "clarify" in session.get_messages()[-1]["content"].lower()
+
+
+def test_damaged_item_creates_support_ticket_without_workflow(monkeypatch):
+    ui = _set_session(monkeypatch)
+    session.set_user("token", "C000001", "customer", "Ava")
+    monkeypatch.setattr(chat.api, "create_ticket", Mock(
+        return_value={"success": True, "ticket_id": "ticket_damaged"}
+    ))
+    start_run = Mock()
+    monkeypatch.setattr(chat.api, "start_run", start_run)
+
+    chat._handle_message("The headphones arrived broken")
+
+    chat.api.create_ticket.assert_called_once_with(
+        "token",
+        "damaged",
+        "The headphones arrived broken",
+    )
+    start_run.assert_not_called()
+    assert ui.session_state[session.CURRENT_TICKET_ID] == "ticket_damaged"
+    assert "support ticket" in session.get_messages()[-1]["content"].lower()
+
+
+def test_completed_order_placement_adds_cart_item_from_run_detail(monkeypatch):
+    ui = _set_session(monkeypatch)
+    session.set_user("token", "C000001", "customer", "Ava")
+    monkeypatch.setattr(chat.detect, "detect_category", lambda prompt: "order_placement")
+    monkeypatch.setattr(
+        chat.api,
+        "create_ticket",
+        Mock(return_value={"success": True, "ticket_id": "ticket_1"}),
+    )
+    monkeypatch.setattr(
+        chat.api,
+        "start_run",
+        Mock(return_value={"success": True, "run_id": "run_1"}),
+    )
+    monkeypatch.setattr(
+        chat.api,
+        "poll_run",
+        Mock(
+            return_value={
+                "success": True,
+                "status": "completed",
+                "final_response": "Added headphones to your cart.",
+            }
+        ),
+    )
+    get_run = Mock(
+        return_value={
+            "success": True,
+            "cart_item": {
+                "product_id": "prod_1",
+                "product_name": "Headphones",
+                "price_minor": 2500,
+                "category": "Audio",
+                "quantity": 2,
+            },
+        }
+    )
+    monkeypatch.setattr(chat.api, "get_run", get_run)
+
+    chat._handle_message("Add headphones")
+
+    get_run.assert_called_once_with("token", "run_1")
+    assert session.get_cart() == [
+        {
+            "product_id": "prod_1",
+            "product_name": "Headphones",
+            "price_minor": 2500,
+            "category": "Audio",
+            "quantity": 2,
+            "line_total_minor": 5000,
+        }
+    ]
+    assert session.get_messages()[-1]["content"] == "Added headphones to your cart."
+    assert ui.session_state[session.AWAITING_CONFIRMATION] is False
+    assert ui.session_state[session.CURRENT_RUN_ID] is None
+
+
+def test_message_after_cart_confirmation_starts_fresh_intent(monkeypatch):
+    ui = _set_session(monkeypatch)
+    session.set_user("token", "C000001", "customer", "Ava")
+    ui.session_state[session.AWAITING_CONFIRMATION] = False
+    detect_category = Mock(return_value="order_placement")
+    monkeypatch.setattr(chat.detect, "detect_category", detect_category)
+    create_ticket = Mock(return_value={"success": True, "ticket_id": "ticket_2"})
+    monkeypatch.setattr(chat.api, "create_ticket", create_ticket)
+    monkeypatch.setattr(
+        chat.api,
+        "start_run",
+        Mock(return_value={"success": True, "run_id": "run_2"}),
+    )
+    monkeypatch.setattr(
+        chat.api,
+        "poll_run",
+        Mock(
+            return_value={
+                "success": True,
+                "status": "paused",
+                "final_response": "Which keyboard would you like?",
+            }
+        ),
+    )
+
+    chat._handle_message("Add a keyboard too")
+
+    detect_category.assert_called_once_with("Add a keyboard too")
+    create_ticket.assert_called_once_with("token", "order_placement", "Add a keyboard too")
+    assert ui.session_state[session.AWAITING_CONFIRMATION] is True
+
+
+def test_cart_continuation_reuses_ticket_and_skips_intent_detection(monkeypatch):
+    ui = _set_session(monkeypatch)
+    session.set_user("token", "C000001", "customer", "Ava")
+    session.add_to_cart(
+        {
+            "product_id": "prod_1",
+            "price_minor": 1250,
+            "line_total_minor": 1250,
+        }
+    )
+    ui.session_state["current_category"] = "order_placement"
+    ui.session_state["ticket_id"] = "ticket_1"
+    ui.session_state[session.CURRENT_RUN_ID] = "old_run"
+    ui.session_state["run_id"] = "old_run"
+    detect_category = Mock()
+    monkeypatch.setattr(chat.detect, "detect_category", detect_category)
+    create_ticket = Mock()
+    monkeypatch.setattr(chat.api, "create_ticket", create_ticket)
+
+    def start_run_side_effect(token, ticket_id, message):
+        assert ui.session_state["run_id"] is None
+        assert message == "Show me keyboards"
+        return {"success": True, "run_id": "run_2"}
+
+    start_run = Mock(side_effect=start_run_side_effect)
+    monkeypatch.setattr(chat.api, "start_run", start_run)
+    monkeypatch.setattr(
+        chat.api,
+        "poll_run",
+        Mock(
+            return_value={
+                "success": True,
+                "status": "paused",
+                "final_response": "Which keyboard would you like?",
+            }
+        ),
+    )
+
+    chat._handle_message("Show me keyboards")
+
+    detect_category.assert_not_called()
+    create_ticket.assert_not_called()
+    start_run.assert_called_once_with("token", "ticket_1", "Show me keyboards")
+    assert ui.session_state["run_id"] == "run_2"
+    assert ui.session_state[session.CURRENT_RUN_ID] == "run_2"
+    assert ui.session_state[session.CURRENT_TICKET_ID] == "ticket_1"
+    assert ui.session_state["ticket_id"] == "ticket_1"
 
 
 def test_add_to_cart_reply_continues_paused_order_run(monkeypatch):
@@ -199,12 +383,12 @@ def test_add_to_cart_reply_continues_paused_order_run(monkeypatch):
         ),
     )
 
-    chat._handle_message("I want option two")
+    chat._handle_message("I'll take the first option")
 
     chat.api.send_message.assert_called_once_with(
         "token",
         "run_1",
-        "I want option two",
+        "I'll take the first option",
     )
     assert ui.session_state[session.AWAITING_CONFIRMATION] is True
     assert session.get_messages()[-1]["content"] == "Which option did you mean?"
@@ -238,7 +422,7 @@ def test_confirm_for_product_resumes_paused_order_run(monkeypatch):
     assert ui.session_state[session.AWAITING_CONFIRMATION] is True
 
 
-def test_add_to_cart_completed_clears_confirmation_and_run(monkeypatch):
+def test_add_to_cart_completed_adds_item_and_clears_confirmation_and_run(monkeypatch):
     ui = _set_session(monkeypatch)
     session.set_user("token", "C000001", "customer", "Ava")
     ui.session_state[session.AWAITING_CONFIRMATION] = True
@@ -251,14 +435,31 @@ def test_add_to_cart_completed_clears_confirmation_and_run(monkeypatch):
             return_value={
                 "success": True,
                 "status": "completed",
-                "final_response": "Order confirmed.",
+                "final_response": "Added headphones to your cart.",
+                "cart_item": {
+                    "product_id": "prod_1",
+                    "product_name": "Headphones",
+                    "price_minor": 2500,
+                    "category": "Audio",
+                    "quantity": 2,
+                },
             }
         ),
     )
 
     chat._handle_add_to_cart("Confirm for headphones")
 
-    assert session.get_messages()[-1]["content"] == "Order confirmed."
+    assert session.get_messages()[-1]["content"] == "Added headphones to your cart."
+    assert session.get_cart() == [
+        {
+            "product_id": "prod_1",
+            "product_name": "Headphones",
+            "price_minor": 2500,
+            "category": "Audio",
+            "quantity": 2,
+            "line_total_minor": 5000,
+        }
+    ]
     assert ui.session_state[session.AWAITING_CONFIRMATION] is False
     assert ui.session_state[session.CURRENT_RUN_ID] is None
 
@@ -349,10 +550,12 @@ def test_messages_render_in_history_container_before_chat_input(monkeypatch):
         ("user", "newer"),
         ("user", "new message"),
     ]
-    assert ui.container_kwargs == [
-        {"height": 600, "border": False},
-        {"height": 600, "border": False},
-    ]
+    assert ui.container_kwargs == [{}, {}]
+    assert len(ui.markdown_calls) == 2
+    for body, options in ui.markdown_calls:
+        assert ".block-container" in body
+        assert ".stChatInput" in body
+        assert options == {"unsafe_allow_html": True}
     assert ui.events.index(("user", "new message")) < len(ui.events) - 1
     handle_message.assert_called_once_with("new message")
 def test_paused_refund_stores_pending_approval(monkeypatch):

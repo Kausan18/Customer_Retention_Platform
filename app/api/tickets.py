@@ -9,6 +9,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
 
 from app.agents.order_status import order_status_graph
 from app.agents.order_tracking import order_tracking_graph
@@ -28,6 +29,10 @@ from app.agents.order_placement import order_placement_graph
 
 router = APIRouter(prefix="/tickets", tags=["tickets"])
 logger = logging.getLogger(__name__)
+
+
+class WorkflowRunRequest(BaseModel):
+    message: str | None = None
 
 
 def _now_iso() -> str:
@@ -60,8 +65,20 @@ POLICY_QUESTION_KEYWORDS = (
 )
 
 
+_REFUND_ACTION_PHRASES = (
+    "return my order",
+    "want to return",
+    "can i return",
+    "i want a refund",
+    "want a refund",
+    "get a refund",
+    "need a refund",
+)
+
 def _is_policy_question(message: str) -> bool:
     message_lower = message.lower()
+    if any(phrase in message_lower for phrase in _REFUND_ACTION_PHRASES):
+        return False
     return any(keyword in message_lower for keyword in POLICY_QUESTION_KEYWORDS)
 
 
@@ -222,7 +239,12 @@ def create_ticket(
 # POST /tickets/{ticket_id}/runs
 # ---------------------------------------------------------------------------
 
-def run_workflow(ticket: dict, run_id: str, customer_id: str) -> dict | None:
+def run_workflow(
+    ticket: dict,
+    run_id: str,
+    customer_id: str,
+    thread_id: str,
+) -> dict | None:
     """
     Dispatches to the correct LangGraph workflow based on ticket category.
     Policy questions and order lookups complete synchronously. Refund and
@@ -326,7 +348,7 @@ def run_workflow(ticket: dict, run_id: str, customer_id: str) -> dict | None:
             "customer_id": customer_id,
             "customer_message": ticket["summary"] or ticket.get("message", ""),
         }
-        config = {"configurable": {"thread_id": run_id}}
+        config = {"configurable": {"thread_id": thread_id}}
         try:
             result = order_placement_graph.invoke(initial_state, config=config)
         except Exception as e:
@@ -380,6 +402,7 @@ def run_workflow(ticket: dict, run_id: str, customer_id: str) -> dict | None:
 def start_run(
     ticket_id: str,
     customer_id: str = Depends(require_session),
+    body: WorkflowRunRequest | None = None,
 ) -> WorkflowRunResponse:
     """
     Start a resolution workflow for a ticket.
@@ -399,24 +422,55 @@ def start_run(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Ticket not found or does not belong to this customer.",
         )
+    if ticket["category"] == "damaged":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Damaged-item tickets are handled by support without a workflow.",
+        )
+
+    request_message = body.message.strip() if body and body.message else None
+    if request_message:
+        decision = inspect_request(request_message, customer_id)
+        if decision.action == "BLOCK":
+            raise HTTPException(
+                status_code=400,
+                detail={"blocked": True, "reason": decision.reason},
+            )
+        run_message = decision.text
+    else:
+        run_message = ticket.get("summary") or ticket.get("message", "")
 
     policy_category = ticket["category"] == "policy"
     policy_question = (
-        not policy_category and _is_policy_question(ticket["summary"] or "")
+        not policy_category and _is_policy_question(run_message)
     )
     if not policy_question and not policy_category:
-        intent_result = validate_intent(ticket["category"], ticket["summary"] or "")
+        intent_result = validate_intent(ticket["category"], run_message)
         if intent_result.action == "BLOCK":
             raise HTTPException(
                 status_code=400,
                 detail={"blocked": True, "reason": intent_result.reason},
             )
 
-    if ticket["status"] not in ("open", "in_progress"):
+    reopening_order_ticket = (
+        ticket["category"] == "order_placement"
+        and ticket["status"] == "resolved"
+        and bool(request_message)
+    )
+    if ticket["status"] not in ("open", "in_progress") and not reopening_order_ticket:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Ticket is already in status '{ticket['status']}'.",
         )
+
+    if request_message:
+        ticket_status = "open" if reopening_order_ticket else ticket["status"]
+        execute(
+            "UPDATE tickets SET summary = ?, status = ?, updated_at = ? WHERE id = ?",
+            (run_message, ticket_status, _now_iso(), ticket_id),
+        )
+        ticket["summary"] = run_message
+        ticket["status"] = ticket_status
 
     run_id = f"run_{uuid.uuid4().hex[:8]}"
     thread_id = str(uuid.uuid4())
@@ -472,7 +526,7 @@ def start_run(
             final_response=policy_answer,
         )
 
-    workflow_result = run_workflow(ticket, run_id, customer_id)
+    workflow_result = run_workflow(ticket, run_id, customer_id, thread_id)
     run_data = fetch_one(
         "SELECT status, completed_at FROM workflow_runs WHERE id = ?",
         (run_id,),
