@@ -1,4 +1,5 @@
 import json
+import re
 from typing import TypedDict, Optional
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import interrupt
@@ -10,6 +11,17 @@ from app.services.audit import log_event
 from app.services.gemini_client import call_gemini
 from app.schemas.workflow_state import CatalogSearchOutput, OrderConfirmationOutput
 
+_MULTI_ADD_PHRASES = {
+    "both", "all", "together", "all of them", "both of them",
+    "order them together", "i would like to order them together",
+    "i ll take both", "ill take both", "add all", "add both",
+    "get both", "all three", "i want both", "i want all",
+}
+
+def _is_multi_add(text: str) -> bool:
+    normalized = " ".join(re.sub(r"[\W_]+", " ", text.lower()).split())
+    return any(phrase in normalized for phrase in _MULTI_ADD_PHRASES)
+
 
 class PlacementState(TypedDict, total=False):
     run_id: str
@@ -20,7 +32,9 @@ class PlacementState(TypedDict, total=False):
     offered_product_ids: Optional[list]
     customer_selection: Optional[str]
     validated_product: dict
+    validated_products: Optional[list]
     cart_item: dict | None = None
+    cart_items: list | None      
     needs_clarification: bool
     final_response: Optional[str]
     run_status: Optional[str]
@@ -137,35 +151,66 @@ def validate_selection_node(state: PlacementState) -> PlacementState:
         product["product_id"]: product for product in state["catalog_results"]
     }
     offered_products = [
-        products_by_id[product_id]
-        for product_id in state["offered_product_ids"]
+        products_by_id[pid] for pid in state["offered_product_ids"]
     ]
-
-    customer_reply = (state.get("customer_reply") or "").strip().lower()
     offered_ids = state.get("offered_product_ids") or []
+    customer_reply = (state.get("customer_selection") or "").strip()
 
-    # Bare confirmation — treat as selecting the first offered product
-    bare_confirmations = {"confirm", "yes", "ok", "okay", "sure", "1", "first", "that one", "this one", "go ahead"}
-    if customer_reply in bare_confirmations and offered_ids:
-        return {"selected_product_id": offered_ids[0], "needs_clarification": False}
+    # Multi-add intent — customer wants all offered products
+    if _is_multi_add(customer_reply):
+        validated_products = [
+            {
+                "product_id": pid,
+                "product_name": products_by_id[pid]["name"],
+                "price_minor": products_by_id[pid]["price_minor"],
+                "category": products_by_id[pid]["category"],
+                "quantity": 1,
+            }
+            for pid in offered_ids
+        ]
+        return {
+            **state,
+            "validated_products": validated_products,
+            "validated_product": validated_products[0],  # keep singular for compat
+            "needs_clarification": False,
+        }
 
+    # Bare single confirmation — first offered product
+    bare_confirmations = {
+        "confirm", "yes", "ok", "okay", "sure", "1", "first",
+        "that one", "this one", "go ahead",
+    }
+    normalized_reply = " ".join(re.sub(r"[\W_]+", " ", customer_reply.lower()).split())
+    if normalized_reply in bare_confirmations and offered_ids:
+        pid = offered_ids[0]
+        return {
+            **state,
+            "validated_product": {
+                "product_id": pid,
+                "product_name": products_by_id[pid]["name"],
+                "price_minor": products_by_id[pid]["price_minor"],
+                "category": products_by_id[pid]["category"],
+                "quantity": 1,
+            },
+            "validated_products": None,
+            "needs_clarification": False,
+        }
+
+    # LLM maps reply to a single product
     prompt = f"""
 [SYSTEM]
 You are a customer support agent for TechMart.
 Respond ONLY with valid JSON matching the schema below.
 
 [CONTEXT]
-Offered products in the same order shown to the customer
-(option numbers are 1-based positions in this list):
+Offered products (1-based numbering matches the order shown to the customer):
 {json.dumps(offered_products, indent=2)}
-Customer reply: {state["customer_selection"]}
+Customer reply: {customer_reply}
 
 [TASK]
-The customer was shown a list of products and asked to confirm their selection.
-Look at their reply carefully.
-- If they name a product, pick a number, or say yes/confirm/ok/that one/first/second etc → map to the correct product_id and set needs_clarification to false.
-- If they ask a question, say "only one?", ask about more options, or do NOT make a clear selection → set needs_clarification to true and set clarification_message to a helpful reply explaining what options are available and asking them to pick one.
-Never guess if the intent is unclear. When in doubt, set needs_clarification to true.
+Map the customer's reply to exactly one product_id from the list above.
+- If they name a product, pick a number, or say yes/confirm/first/second → map to the correct product_id, needs_clarification false.
+- If the intent is unclear → needs_clarification true, clarification_message explains the options.
 
 [OUTPUT FORMAT]
 {{
@@ -187,40 +232,60 @@ Never guess if the intent is unclear. When in doubt, set needs_clarification to 
             "error_message": f"validate_selection_node validation failed: {e}",
         }
 
-    if parsed.needs_clarification or parsed.selected_product_id not in state["offered_product_ids"]:
-        clarification_message = parsed.clarification_message.strip()
+    if parsed.needs_clarification or parsed.selected_product_id not in offered_ids:
         return {
             **state,
             "customer_selection": None,
             "needs_clarification": True,
-            "final_response": clarification_message or (
+            "validated_products": None,
+            "final_response": parsed.clarification_message.strip() or (
                 "Please choose one of the listed products by number or name. "
                 "I won't place the order until you confirm a specific item."
             ),
         }
 
+    pid = parsed.selected_product_id
     return {
         **state,
         "validated_product": {
-            "product_id": parsed.selected_product_id,
-            "product_name": products_by_id[parsed.selected_product_id]["name"],
-            "price_minor": products_by_id[parsed.selected_product_id]["price_minor"],
-            "category": products_by_id[parsed.selected_product_id]["category"],
+            "product_id": pid,
+            "product_name": products_by_id[pid]["name"],
+            "price_minor": products_by_id[pid]["price_minor"],
+            "category": products_by_id[pid]["category"],
             "quantity": parsed.quantity,
         },
+        "validated_products": None,
         "needs_clarification": False,
     }
 
-
 def build_cart_response_node(state: PlacementState) -> PlacementState:
-    validated_product = state["validated_product"]
-    cart_item = {
-        **validated_product,
-        "quantity": validated_product.get("quantity", 1),
-    }
+    # Multi-add path
+    if state.get("validated_products"):
+        items = [
+            {**p, "quantity": p.get("quantity", 1)}
+            for p in state["validated_products"]
+        ]
+        names = ", ".join(p["product_name"] for p in items)
+        total = sum(p["price_minor"] * p["quantity"] for p in items)
+        return {
+            **state,
+            "cart_items": items,
+            "cart_item": None,
+            "final_response": (
+                f"Got it! I've added {names} to your cart "
+                f"(₹{total / 100:.2f} total). "
+                "You can add more items or type 'checkout' to proceed to payment."
+            ),
+            "run_status": "completed",
+        }
+
+    # Single-item path
+    p = state["validated_product"]
+    cart_item = {**p, "quantity": p.get("quantity", 1)}
     return {
         **state,
         "cart_item": cart_item,
+        "cart_items": None,
         "final_response": (
             f"Got it! I've added {cart_item['product_name']} "
             f"(₹{cart_item['price_minor'] / 100:.2f}) to your cart. "
@@ -228,7 +293,6 @@ def build_cart_response_node(state: PlacementState) -> PlacementState:
         ),
         "run_status": "completed",
     }
-
 
 def update_ticket_node(state: PlacementState) -> PlacementState:
     update_ticket(

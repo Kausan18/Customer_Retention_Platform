@@ -144,6 +144,7 @@ def init_new_chat_session() -> None:
         if key in st.session_state:
             del st.session_state[key]
     st.session_state["messages"] = []
+    st.session_state[PAYMENT_READY] = False
     init_session_state()
 
 

@@ -64,6 +64,21 @@ _CHECKOUT_KEYWORDS = (
     "confirm cart",
     "pay",
 )
+
+_MULTI_ADD_PHRASES = (
+    "both",
+    "together",
+    "all of them",
+    "all three",
+    "all of these",
+    "order them together",
+    "take both",
+    "i ll take both",
+    "ill take both",
+    "add all",
+    "add both",
+    "get both",
+)
 def _normalize_text(text: str) -> str:
     return " ".join(re.sub(r"[\W_]+", " ", text.lower()).split())
 
@@ -102,11 +117,12 @@ def render() -> None:
     </style>
     """, unsafe_allow_html=True)
 
-    title_column, logout_column = st.columns([4, 1])
+    title_column, logout_column = st.columns([3, 1])
     with title_column:
         st.header("TechMart Customer Support")
     with logout_column:
-        if st.button("Logout", key="chat_logout", type="tertiary"):
+        if st.button("Logout", key="chat_logout", type="secondary"):
+            session.save_current_session_to_history()
             api.logout(session.get_token())
             session.clear_user()
             st.session_state["page"] = "login"
@@ -160,13 +176,8 @@ def _handle_message(prompt: str) -> None:
         st.session_state["current_category"] = category
 
     if st.session_state.get(session.AWAITING_CONFIRMATION, False):
-        if (
-            _matches_any(prompt, _CART_ADDITION_KEYWORDS)
-            or _is_order_selection_reply(prompt)
-            or category == "order_placement"
-        ):
-            _handle_add_to_cart(prompt)
-            return
+        _handle_add_to_cart(prompt)
+        return
 
         st.session_state[session.AWAITING_CONFIRMATION] = False
         st.session_state[session.CURRENT_RUN_ID] = None
@@ -236,21 +247,20 @@ def _handle_message(prompt: str) -> None:
     status = result.get("status")
     if status == "completed" and category == "order_placement":
         run_detail = api.get_run(session.get_token(), run_id)
+        cart_items = result.get("cart_items") or run_detail.get("cart_items")
         cart_item = result.get("cart_item") or run_detail.get("cart_item")
         session.add_message(
             "assistant",
             result.get("final_response") or "Your request is complete.",
         )
-        if isinstance(cart_item, dict):
+        if isinstance(cart_items, list):
+            for item in cart_items:
+                _add_cart_item(item)
+        elif isinstance(cart_item, dict):
             _add_cart_item(cart_item)
         st.session_state[session.AWAITING_CONFIRMATION] = False
         st.session_state[session.CURRENT_RUN_ID] = None
         st.session_state["run_id"] = None
-    elif status == "completed":
-        session.add_message(
-            "assistant",
-            result.get("final_response") or "Your request is complete.",
-        )
     elif status == "paused" and category == "order_placement":
         _handle_placement_pause(result)
     elif status == "paused" and category in ("refund", "exchange"):
@@ -258,7 +268,7 @@ def _handle_message(prompt: str) -> None:
     elif status == "failed":
         session.add_message(
             "assistant",
-            "I encountered an issue. Please try again or contact support.",
+            f"Debug — failed. response: {result}",
         )
     else:
         session.add_message(
@@ -311,8 +321,12 @@ def _handle_add_to_cart(prompt: str) -> None:
 
     status = result.get("status")
     if status == "completed":
+        cart_items = result.get("cart_items")
         cart_item = result.get("cart_item")
-        if isinstance(cart_item, dict):
+        if isinstance(cart_items, list):
+            for item in cart_items:
+                _add_cart_item(item)
+        elif isinstance(cart_item, dict):
             _add_cart_item(cart_item)
         session.add_message(
             "assistant",
@@ -356,6 +370,7 @@ def _handle_approval_pause(result: dict) -> None:
 
 def _render_sidebar() -> None:
     if st.button("➕ New Chat", use_container_width=True):
+        session.save_current_session_to_history()
         session.init_new_chat_session()
         st.rerun()
         return
@@ -399,12 +414,12 @@ def _render_sidebar() -> None:
                 st.rerun()
                 return
 
-        pending_approval = st.session_state.get(session.PENDING_APPROVAL)
-    if pending_approval:
+    st.divider()
+    pending = st.session_state.get(session.PENDING_APPROVAL)
+    if pending:
         st.warning("⏳ Awaiting reviewer decision")
-        # Auto-poll on every render — no button needed
         token = session.get_token()
-        result = api.poll_run(token, pending_approval["run_id"])
+        result = api.poll_run(token, pending["run_id"])
         if result.get("status") == "completed":
             session.add_message(
                 "assistant",

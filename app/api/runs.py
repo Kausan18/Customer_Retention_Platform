@@ -61,11 +61,13 @@ def get_run(
 ) -> WorkflowRunResponse:
     run = _get_run_with_ownership(run_id, customer_id)
     cart_item = None
+    cart_items = None
     if run["ticket_category"] == "order_placement":
         config = {"configurable": {"thread_id": run["thread_id"]}}
         snapshot = order_placement_graph.get_state(config)
         if snapshot and snapshot.values:
             cart_item = snapshot.values.get("cart_item")
+            cart_items = snapshot.values.get("cart_items")
 
     return WorkflowRunResponse(
         run_id=run["id"],
@@ -76,6 +78,7 @@ def get_run(
         completed_at=run["completed_at"],
         final_response=run["final_response"],
         cart_item=cart_item,
+        cart_items=cart_items,
     )
 
 
@@ -179,4 +182,5 @@ def submit_message(run_id: str, body: CustomerMessage, customer_id: str = Depend
         "status": final_status,
         "final_response": result.get("final_response"),
         "cart_item": result.get("cart_item"),
+        "cart_items": result.get("cart_items"),
     }

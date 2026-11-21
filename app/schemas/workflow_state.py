@@ -12,6 +12,7 @@ class WorkflowRunResponse(BaseModel):
     completed_at: str | None = None
     final_response: Optional[str] = None
     cart_item: dict | None = None
+    cart_items: list | None = None
 
 
 class WorkflowEvent(BaseModel):

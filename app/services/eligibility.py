@@ -26,21 +26,24 @@ EXCHANGE_WINDOW_DAYS = 15
 # i.e. far enough along that a refund can be evaluated.
 _RECEIVED_RETURN_STATUSES = {"received", "inspecting", "passed"}
 
-_DATE_FORMATS = (
+_DATE_FORMATS = [
     "%Y-%m-%dT%H:%M:%SZ",
+    "%Y-%m-%dT%H:%M:%S.%fZ",
     "%Y-%m-%dT%H:%M:%S",
-    "%Y-%m-%d %H:%M:%S",
-    "%Y-%m-%d",
-)
+    "%Y-%m-%dT%H:%M:%S.%f",
+    "%Y-%m-%dT%H:%M:%S+00:00",        # ← add this
+    "%Y-%m-%dT%H:%M:%S.%f+00:00",     # ← add this
+]
 
 def _parse_dt(value: str) -> datetime:
-    """Parse a timestamp stored by seed.py, trying known formats."""
-    for fmt in _DATE_FORMATS:
-        try:
-            return datetime.strptime(value, fmt)
-        except ValueError:
-            continue
-    raise ValueError(f"Unrecognized date format: {value!r}")
+    if not value:
+        raise ValueError("Empty date string")
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        # Strip tzinfo so comparisons with naive datetimes work
+        return dt.replace(tzinfo=None)
+    except ValueError:
+        raise ValueError(f"Unrecognized date format: {value!r}")
 
 
 def _ineligible(order_id: str, error_code: str, reason: str) -> Dict[str, Any]:

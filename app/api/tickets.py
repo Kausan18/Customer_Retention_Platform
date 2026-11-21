@@ -128,10 +128,6 @@ def _build_initial_exchange_state(ticket: dict, run_id: str, customer_id: str) -
 def _run_graph_and_update_status(
     graph, initial_state: dict, run_id: str, ticket_id: str
 ) -> None:
-    """
-    Invoke a LangGraph graph, check whether it paused at an interrupt or
-    completed, and update workflow_runs.status accordingly.
-    """
     run_data = fetch_one(
         "SELECT thread_id FROM workflow_runs WHERE id = ? AND ticket_id = ?",
         (run_id, ticket_id),
@@ -143,24 +139,18 @@ def _run_graph_and_update_status(
 
     try:
         result = graph.invoke(initial_state, config=config)
-        graph_state = graph.get_state(config)
-
-        if graph_state.next:
-            execute(
-                "UPDATE workflow_runs SET status = 'paused' WHERE id = ?",
-                (run_id,),
-            )
-        else:
-            error_code = result.get("error_code")
-            final_status = "failed" if error_code else "completed"
-            execute(
-                "UPDATE workflow_runs SET status = ?, completed_at = ? WHERE id = ?",
-                (final_status, datetime.now(timezone.utc).isoformat(), run_id),
-            )
+        print(f"[DEBUG graph] error_code={result.get('error_code')} error_message={result.get('error_message')} final_response={result.get('final_response')}")
     except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        completed_at = datetime.now(timezone.utc).isoformat()
         execute(
             "UPDATE workflow_runs SET status = 'failed', completed_at = ? WHERE id = ?",
-            (datetime.now(timezone.utc).isoformat(), run_id),
+            (completed_at, run_id),
+        )
+        execute(
+            "UPDATE tickets SET summary = ?, status = 'escalated', updated_at = ? WHERE id = ?",
+            (f"Workflow error: {exc}", completed_at, ticket_id),
         )
         audit.log_event(
             run_id=run_id,
@@ -168,7 +158,43 @@ def _run_graph_and_update_status(
             event_type="workflow_exception",
             payload={"error": str(exc)},
         )
+        return
 
+    graph_state = graph.get_state(config)
+    final_response = result.get("final_response") or ""
+    error_code = result.get("error_code")
+    completed_at = datetime.now(timezone.utc).isoformat()
+
+    if graph_state.next:
+        # Graph paused at interrupt — waiting for reviewer
+        execute(
+            "UPDATE workflow_runs SET status = 'paused' WHERE id = ?",
+            (run_id,),
+        )
+        execute(
+            "UPDATE tickets SET summary = ?, updated_at = ? WHERE id = ?",
+            (final_response, completed_at, ticket_id),
+        )
+    elif error_code:
+        # Graph completed but hit a business rule error (ineligible, missing data etc)
+        execute(
+            "UPDATE workflow_runs SET status = 'failed', completed_at = ? WHERE id = ?",
+            (completed_at, run_id),
+        )
+        execute(
+            "UPDATE tickets SET summary = ?, status = 'resolved', updated_at = ? WHERE id = ?",
+            (final_response, completed_at, ticket_id),
+        )
+    else:
+        # Graph completed successfully
+        execute(
+            "UPDATE workflow_runs SET status = 'completed', completed_at = ? WHERE id = ?",
+            (completed_at, run_id),
+        )
+        execute(
+            "UPDATE tickets SET summary = ?, status = 'resolved', updated_at = ? WHERE id = ?",
+            (final_response, completed_at, ticket_id),
+        )
 
 # ---------------------------------------------------------------------------
 # POST /tickets
