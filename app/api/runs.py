@@ -62,7 +62,7 @@ def get_run(
     run = _get_run_with_ownership(run_id, customer_id)
     cart_item = None
     cart_items = None
-    if run["ticket_category"] == "order_placement":
+    if run.get("ticket_category") == "order_placement":
         config = {"configurable": {"thread_id": run["thread_id"]}}
         snapshot = order_placement_graph.get_state(config)
         if snapshot and snapshot.values:

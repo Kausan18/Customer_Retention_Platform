@@ -1,5 +1,11 @@
 """Streamlit entry point and session-based page router."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+# Load .env before any app.* imports resolve
+from app.main import load_environment
+load_environment(Path(__file__).resolve().parents[1] / ".env")
 import streamlit as st
 
 from frontend.pages import chat, login, payment, reviewer, signup

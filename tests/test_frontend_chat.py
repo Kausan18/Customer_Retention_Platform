@@ -130,7 +130,7 @@ def test_sidebar_history_shows_newest_first_and_loads_selected_session(monkeypat
 def test_handle_message_creates_ticket_and_adds_completed_response(monkeypatch):
     ui = _set_session(monkeypatch)
     session.set_user("token", "C000001", "customer", "Ava")
-    monkeypatch.setattr(chat.detect, "detect_category", lambda prompt: "order_status")
+    monkeypatch.setattr(chat, "classify_intent", lambda prompt: "order_status")
     monkeypatch.setattr(
         chat.api,
         "create_ticket",
@@ -173,8 +173,8 @@ def test_checkout_with_items_marks_payment_ready_without_workflow(monkeypatch):
     monkeypatch.setattr(chat.api, "create_ticket", create_ticket)
     start_run = Mock()
     monkeypatch.setattr(chat.api, "start_run", start_run)
-    detect_category = Mock()
-    monkeypatch.setattr(chat.detect, "detect_category", detect_category)
+    classify_intent = Mock()
+    monkeypatch.setattr(chat, "classify_intent", classify_intent)
 
     chat._handle_message("That's all, checkout")
 
@@ -184,7 +184,7 @@ def test_checkout_with_items_marks_payment_ready_without_workflow(monkeypatch):
     )
     create_ticket.assert_not_called()
     start_run.assert_not_called()
-    detect_category.assert_not_called()
+    classify_intent.assert_not_called()
 
 
 def test_unknown_message_requests_clarification_without_ticket(monkeypatch):
@@ -194,6 +194,7 @@ def test_unknown_message_requests_clarification_without_ticket(monkeypatch):
     start_run = Mock()
     monkeypatch.setattr(chat.api, "create_ticket", create_ticket)
     monkeypatch.setattr(chat.api, "start_run", start_run)
+    monkeypatch.setattr(chat, "classify_intent", lambda prompt: "unknown")
 
     chat._handle_message("Can you help me?")
 
@@ -226,7 +227,7 @@ def test_damaged_item_creates_support_ticket_without_workflow(monkeypatch):
 def test_completed_order_placement_adds_cart_item_from_run_detail(monkeypatch):
     ui = _set_session(monkeypatch)
     session.set_user("token", "C000001", "customer", "Ava")
-    monkeypatch.setattr(chat.detect, "detect_category", lambda prompt: "order_placement")
+    monkeypatch.setattr(chat, "classify_intent", lambda prompt: "order_placement")
     monkeypatch.setattr(
         chat.api,
         "create_ticket",
@@ -284,8 +285,8 @@ def test_message_after_cart_confirmation_starts_fresh_intent(monkeypatch):
     ui = _set_session(monkeypatch)
     session.set_user("token", "C000001", "customer", "Ava")
     ui.session_state[session.AWAITING_CONFIRMATION] = False
-    detect_category = Mock(return_value="order_placement")
-    monkeypatch.setattr(chat.detect, "detect_category", detect_category)
+    classify_intent = Mock(return_value="order_placement")
+    monkeypatch.setattr(chat, "classify_intent", classify_intent)
     create_ticket = Mock(return_value={"success": True, "ticket_id": "ticket_2"})
     monkeypatch.setattr(chat.api, "create_ticket", create_ticket)
     monkeypatch.setattr(
@@ -307,7 +308,7 @@ def test_message_after_cart_confirmation_starts_fresh_intent(monkeypatch):
 
     chat._handle_message("Add a keyboard too")
 
-    detect_category.assert_called_once_with("Add a keyboard too")
+    classify_intent.assert_called_once_with("Add a keyboard too")
     create_ticket.assert_called_once_with("token", "order_placement", "Add a keyboard too")
     assert ui.session_state[session.AWAITING_CONFIRMATION] is True
 
@@ -326,8 +327,8 @@ def test_cart_continuation_reuses_ticket_and_skips_intent_detection(monkeypatch)
     ui.session_state["ticket_id"] = "ticket_1"
     ui.session_state[session.CURRENT_RUN_ID] = "old_run"
     ui.session_state["run_id"] = "old_run"
-    detect_category = Mock()
-    monkeypatch.setattr(chat.detect, "detect_category", detect_category)
+    classify_intent = Mock()
+    monkeypatch.setattr(chat, "classify_intent", classify_intent)
     create_ticket = Mock()
     monkeypatch.setattr(chat.api, "create_ticket", create_ticket)
 
@@ -352,7 +353,7 @@ def test_cart_continuation_reuses_ticket_and_skips_intent_detection(monkeypatch)
 
     chat._handle_message("Show me keyboards")
 
-    detect_category.assert_not_called()
+    classify_intent.assert_not_called()
     create_ticket.assert_not_called()
     start_run.assert_called_once_with("token", "ticket_1", "Show me keyboards")
     assert ui.session_state["run_id"] == "run_2"
@@ -497,7 +498,7 @@ def test_new_intent_clears_paused_run_before_creating_ticket(monkeypatch):
         assert ui.session_state[session.CURRENT_TICKET_ID] is None
         return {"success": True, "ticket_id": "new_ticket"}
 
-    monkeypatch.setattr(chat.detect, "detect_category", lambda prompt: "order_tracking")
+    monkeypatch.setattr(chat, "classify_intent", lambda prompt: "order_tracking")
     monkeypatch.setattr(chat.api, "create_ticket", create_ticket)
     monkeypatch.setattr(
         chat.api,
@@ -558,10 +559,12 @@ def test_messages_render_in_history_container_before_chat_input(monkeypatch):
         assert options == {"unsafe_allow_html": True}
     assert ui.events.index(("user", "new message")) < len(ui.events) - 1
     handle_message.assert_called_once_with("new message")
+
+
 def test_paused_refund_stores_pending_approval(monkeypatch):
     ui = _set_session(monkeypatch)
     session.set_user("token", "C000001", "customer", "Ava")
-    monkeypatch.setattr(chat.detect, "detect_category", lambda prompt: "refund")
+    monkeypatch.setattr(chat, "classify_intent", lambda prompt: "refund")
     monkeypatch.setattr(
         chat.api,
         "create_ticket",

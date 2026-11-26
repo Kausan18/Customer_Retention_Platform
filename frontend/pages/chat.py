@@ -1,11 +1,13 @@
 """Customer chat page with workflow handling and a cart sidebar."""
-
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import re
 import streamlit as st
 
 from frontend.components import chat_bubble as cb, order_card as oc
-from frontend.utils import api, detect_category as detect, session
-
+from app.agents.router import classify_intent
+from frontend.utils import api, session
 
 _CART_ADDITION_KEYWORDS = (
     "add",
@@ -172,7 +174,7 @@ def _handle_message(prompt: str) -> None:
         st.session_state[session.CURRENT_RUN_ID] = None
         st.session_state[session.AWAITING_CONFIRMATION] = False
     else:
-        category = detect.detect_category(prompt)
+        category = classify_intent(prompt)
         st.session_state["current_category"] = category
 
     if st.session_state.get(session.AWAITING_CONFIRMATION, False):
@@ -184,6 +186,28 @@ def _handle_message(prompt: str) -> None:
         st.session_state[session.CURRENT_TICKET_ID] = None
         st.session_state["run_id"] = None
         st.session_state["ticket_id"] = None
+
+        if category == "greeting":
+            session.add_message(
+            "assistant",
+            "Hi! I can help you with orders, refunds, exchanges, tracking, or product questions. What do you need?",
+        )
+        return
+
+    if category == "policy":
+        from app.tools.policy_tools import search_policy_tool
+        from app.services.gemini_client import call_gemini
+        passages = search_policy_tool(prompt).get("passages", [])
+        if passages:
+            context = "\n\n".join(p["content"] for p in passages)
+            answer = call_gemini(
+                f"Answer this customer policy question using only the passages below.\n"
+                f"Question: {prompt}\n\nPassages:\n{context}"
+            )
+        else:
+            answer = "I couldn't find a specific policy for that. Please contact support for details."
+        session.add_message("assistant", answer)
+        return
 
     if category == "unknown":
         session.add_message(

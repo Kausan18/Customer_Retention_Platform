@@ -172,6 +172,8 @@ def explain_ineligible_node(state: RefundState) -> dict:
         "ORDER_NOT_FOUND": "We couldn't find that order on your account.",
         "NO_ORDER_FOUND": "We couldn't find that order on your account.",
     }
+    
+    
     return {
         "final_response": messages.get(
             error_code,
@@ -349,6 +351,10 @@ def update_ticket_node(state: RefundState) -> dict:
         "workflow_completed",
         json.dumps({"final_status": status, "error_code": error_code}),
     )
+    db_execute(
+        "UPDATE workflow_runs SET status = 'completed' WHERE id = ?",
+        (state["run_id"],),
+    )
     return {}
 
 
@@ -363,6 +369,10 @@ def handle_error_node(state: RefundState) -> dict:
         "system",
         "workflow_error",
         json.dumps({"error_code": error_code, "message": message}),
+    )
+    db_execute(
+        "UPDATE workflow_runs SET status = 'failed' WHERE id = ?",
+        (state["run_id"],),
     )
     return {
         "final_response": (

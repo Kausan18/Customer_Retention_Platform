@@ -7,6 +7,7 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from app.tools.catalog_tools import extract_catalog_keywords, search_catalog
 from app.tools.ticket_tools import update_ticket
+from app.db.database import execute as db_execute
 from app.services.audit import log_event
 from app.services.gemini_client import call_gemini
 from app.schemas.workflow_state import CatalogSearchOutput, OrderConfirmationOutput
@@ -136,6 +137,10 @@ order as the products array. End your message by asking the customer to confirm 
 def await_confirmation_node(state: PlacementState) -> PlacementState:
     if state.get("error_code"):
         return state
+    db_execute(
+        "UPDATE workflow_runs SET status = 'paused' WHERE id = ?",
+        (state["run_id"],),
+    )
     selection = interrupt({
         "offered_product_ids": state["offered_product_ids"],
         "message": state["final_response"],
@@ -307,6 +312,10 @@ def update_ticket_node(state: PlacementState) -> PlacementState:
         event_type="workflow_completed",
         payload=None,
     )
+    db_execute(
+        "UPDATE workflow_runs SET status = 'completed' WHERE id = ?",
+        (state["run_id"],),
+    )
     return state
 
 
@@ -327,6 +336,10 @@ def handle_error_node(state: PlacementState) -> PlacementState:
             actor="system",
             event_type="workflow_completed",
             payload=json.dumps({"outcome": "product_not_found"}),
+        )
+        db_execute(
+            "UPDATE workflow_runs SET status = 'completed' WHERE id = ?",
+            (state["run_id"],),
         )
         return {
             **state,
@@ -352,8 +365,11 @@ def handle_error_node(state: PlacementState) -> PlacementState:
         event_type="workflow_error",
         payload=json.dumps({"error_code": state.get("error_code"), "error_message": state.get("error_message")}),
     )
+    db_execute(
+        "UPDATE workflow_runs SET status = 'failed' WHERE id = ?",
+        (state["run_id"],),
+    )
     return {**state, "final_response": safe_message}
-
 
 def route_after(state: PlacementState) -> str:
     return "handle_error_node" if state.get("error_code") else "continue"

@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from app.tools.order_tools import get_order, get_shipment, get_recent_orders
 from app.tools.ticket_tools import update_ticket
+from app.db.database import execute as db_execute
 from app.services.audit import log_event
 from app.guardrails.output_validator import validate_output
 from app.services.gemini_client import call_gemini
@@ -96,7 +97,6 @@ Do not invent a delivery date if estimated_delivery is missing.
 
     return {"response": validated.explanation}
 
-
 def update_ticket_node(state: OrderTrackingState) -> dict:
     result = update_ticket(
         state["ticket_id"], "resolved", state["response"], state["customer_id"]
@@ -105,8 +105,16 @@ def update_ticket_node(state: OrderTrackingState) -> dict:
                {"ticket_id": state["ticket_id"], "category": "order_tracking"})
 
     if not result["success"]:
+        db_execute(
+            "UPDATE workflow_runs SET status = 'failed' WHERE id = ?",
+            (state["run_id"],),
+        )
         return {"error": result["error_code"], "final_status": "escalated"}
 
+    db_execute(
+        "UPDATE workflow_runs SET status = 'completed' WHERE id = ?",
+        (state["run_id"],),
+    )
     return {"final_status": "resolved"}
 
 
@@ -115,8 +123,11 @@ def handle_error(state: OrderTrackingState) -> dict:
     update_ticket(state["ticket_id"], "escalated", safe_response, state["customer_id"])
     log_event(state["run_id"], state["customer_id"], "workflow_error",
                {"ticket_id": state["ticket_id"], "error_code": state.get("error")})
+    db_execute(
+        "UPDATE workflow_runs SET status = 'failed' WHERE id = ?",
+        (state["run_id"],),
+    )
     return {"final_status": "escalated", "response": safe_response}
-
 
 def route_after_resolve(state: OrderTrackingState) -> str:
     return "handle_error" if state.get("error") else "fetch_facts"

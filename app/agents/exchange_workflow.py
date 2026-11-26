@@ -42,6 +42,7 @@ from app.tools.catalog_tools import (
 from app.services.eligibility import check_exchange_eligibility
 from app.services.gemini_client import call_gemini
 from app.guardrails.output_validator import validate_output
+from app.db.database import execute as db_execute
 from app.services.audit import log_event
 
 VALID_CATEGORIES = {"Electronics", "Clothing", "Cosmetics", "Food", "Shoes", "Toys"}
@@ -165,6 +166,7 @@ def explain_ineligible_node(state: ExchangeState) -> dict:
             "Could you please provide your order ID so I can look into the exchange for you?"
         ),
     }
+
     return {
         "final_response": messages.get(
             error_code,
@@ -447,6 +449,10 @@ def update_ticket_node(state: ExchangeState) -> dict:
         "workflow_completed",
         json.dumps({"final_status": status, "error_code": error_code}),
     )
+    db_execute(
+        "UPDATE workflow_runs SET status = 'completed' WHERE id = ?",
+        (state["run_id"],),
+    )
     return {}
 
 
@@ -470,8 +476,11 @@ def handle_error_node(state: ExchangeState) -> dict:
     )
     log_event(state["run_id"], "system", "workflow_error",
               json.dumps({"error_code": error_code, "message": message}))
+    db_execute(
+        "UPDATE workflow_runs SET status = 'failed' WHERE id = ?",
+        (state["run_id"],),
+    )
     return {"final_response": state["final_response"]}
-
 
 # ─── Routing functions ─────────────────────────────────────────────────────────
 
